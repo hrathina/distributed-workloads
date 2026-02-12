@@ -121,7 +121,6 @@ func TestRhaiFeaturesMultiGpuRocm(t *testing.T) {
 	sdktests.RunRhaiFeaturesAllMultiGpuTest(t, support.AMD, 2, 2)
 }
 
-
 // S3 Checkpoint tests (auto-skip if S3 not configured)
 func TestRhaiS3CheckpointingCPU(t *testing.T) {
 	Tags(t, Tier1)
