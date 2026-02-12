@@ -17,6 +17,7 @@ limitations under the License.
 package sdk_tests
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -30,6 +31,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/remotecommand"
 
 	common "github.com/opendatahub-io/distributed-workloads/tests/common"
 	. "github.com/opendatahub-io/distributed-workloads/tests/common/support"
@@ -39,6 +42,8 @@ import (
 const (
 	rhaiFeaturesNotebookName = "rhai_features.ipynb"
 	rhaiFeaturesNotebookPath = "resources/" + rhaiFeaturesNotebookName
+	cloudCheckpointUtilsPath = "resources/cloud_checkpoint_utils.py"
+	cloudCheckpointUtilsName = "cloud_checkpoint_utils.py"
 
 	// Annotation keys for progression tracking (must match SDK/training-operator constants)
 	annotationProgressionTracking = "trainer.opendatahub.io/progression-tracking"
@@ -48,7 +53,7 @@ const (
 )
 
 // Compiled regex for epoch detection (compiled once for performance)
-var epochPattern = regexp.MustCompile(`'epoch': [1-9]`)
+var epochPattern = regexp.MustCompile(`'epoch': [2-9]`)
 
 // boolStr converts bool to "true"/"false" string for env vars
 func boolStr(b bool) string {
@@ -56,6 +61,108 @@ func boolStr(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+// cleanupCloudCheckpoints deletes all checkpoint files from cloud storage after test completion
+// Delegates all validation and execution to the Python utility script
+func cleanupCloudCheckpoints(test Test, namespace, checkpointURI string) {
+	test.T().Logf("Starting cloud checkpoint cleanup for: %s", checkpointURI)
+
+	// Get S3 credentials from environment
+	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
+	s3AccessKey, _ := GetStorageBucketAccessKeyId()
+	s3SecretKey, _ := GetStorageBucketSecretKey()
+
+	// Find the notebook pod to exec the cleanup script
+	allPods, err := test.Client().Core().CoreV1().Pods(namespace).List(
+		test.Ctx(),
+		metav1.ListOptions{},
+	)
+	if err != nil {
+		test.T().Logf("Failed to list pods for cleanup: %v", err)
+		return
+	}
+
+	var notebookPod *corev1.Pod
+	for _, pod := range allPods.Items {
+		if strings.HasPrefix(pod.Name, "jupyter-nb-") && pod.Status.Phase == corev1.PodRunning {
+			notebookPod = &pod
+			break
+		}
+	}
+
+	if notebookPod == nil {
+		test.T().Log("No running notebook pod found for cleanup, skipping")
+		return
+	}
+
+	// Build cleanup command with environment variables
+	cleanupCmd := fmt.Sprintf(
+		"export CHECKPOINT_OUTPUT_DIR='%s' && "+
+			"export AWS_DEFAULT_ENDPOINT='%s' && "+
+			"export AWS_ACCESS_KEY_ID='%s' && "+
+			"export AWS_SECRET_ACCESS_KEY='%s' && "+
+			"python /opt/app-root/notebooks/%s --cleanup",
+		checkpointURI, s3Endpoint, s3AccessKey, s3SecretKey, cloudCheckpointUtilsName,
+	)
+
+	// Execute cleanup script in notebook pod (best effort)
+	var stdout, stderr bytes.Buffer
+	execErr := execInPod(test, namespace, notebookPod.Name, "jupyter-nb-kube-3aadmin", []string{"/bin/sh", "-c", cleanupCmd}, &stdout, &stderr)
+
+	if execErr != nil {
+		test.T().Logf("Cloud checkpoint cleanup completed with warnings: %v", execErr)
+		if stderr.Len() > 0 {
+			test.T().Logf("Cleanup stderr: %s", stderr.String())
+		}
+	} else {
+		test.T().Log("Cloud checkpoint cleanup successful")
+		if stdout.Len() > 0 {
+			test.T().Logf("Cleanup output: %s", stdout.String())
+		}
+	}
+}
+
+// execInPod executes a command in a pod container using the remotecommand API
+func execInPod(test Test, namespace, podName, containerName string, command []string, stdout, stderr *bytes.Buffer) error {
+	test.T().Helper()
+
+	req := test.Client().Core().CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: containerName,
+			Command:   command,
+			Stdout:    true,
+			Stderr:    true,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(test.Config(), "POST", req.URL())
+	if err != nil {
+		return fmt.Errorf("failed to create executor: %w", err)
+	}
+
+	err = exec.StreamWithContext(test.Ctx(), remotecommand.StreamOptions{
+		Stdout: stdout,
+		Stderr: stderr,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to exec command: %w", err)
+	}
+
+	return nil
+}
+
+// buildPreRunCheckpointSetupCmd returns optional command snippet to prepare
+// checkpoint storage before notebook execution (cleanup for cloud checkpoint tests).
+func buildPreRunCheckpointSetupCmd(config RhaiFeatureConfig) string {
+	if !config.UseS3Checkpoints {
+		return ""
+	}
+	// Best effort only: never fail test execution because of pre-cleanup.
+	return fmt.Sprintf("python /opt/app-root/notebooks/%s --prepare || true; ", cloudCheckpointUtilsName)
 }
 
 // RhaiFeatureConfig holds configuration for RHAI feature tests
@@ -68,6 +175,7 @@ type RhaiFeatureConfig struct {
 	Accelerator               Accelerator // CPU, NVIDIA, or AMD
 	NumNodes                  int         // Number of training nodes (default: 2)
 	NumGpusPerNode            int         // GPUs per node for multi-GPU tests (default: 1)
+	UseS3Checkpoints          bool        // Use S3 for checkpoint storage (creates Data Connection secret)
 }
 
 // RunRhaiFeaturesProgressionTest runs the e2e test for RHAI features with progression tracking
@@ -154,6 +262,48 @@ func RunRhaiFeaturesAllMultiGpuTest(t *testing.T, accelerator Accelerator, numNo
 	})
 }
 
+// RunRhaiS3CheckpointTest runs the e2e test for S3 checkpoint storage (skips if S3 not configured)
+func RunRhaiS3CheckpointTest(t *testing.T, accelerator Accelerator) {
+	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
+	s3Bucket, _ := GetStorageBucketName()
+	if s3Endpoint == "" || s3Bucket == "" {
+		t.Skip("S3 not configured, skipping S3 checkpoint test")
+	}
+
+	runRhaiFeaturesTestWithConfig(t, RhaiFeatureConfig{
+		EnableProgressionTracking: false,
+		EnableJitCheckpoint:       true,
+		UseS3Checkpoints:          true,
+		CheckpointOutputDir:       fmt.Sprintf("s3://%s/checkpoints", s3Bucket),
+		CheckpointSaveStrategy:    "epoch",
+		CheckpointSaveTotalLimit:  "3",
+		Accelerator:               accelerator,
+		NumNodes:                  2,
+		NumGpusPerNode:            1,
+	})
+}
+
+// RunRhaiS3CheckpointMultiGpuTest runs multi-GPU test for S3 checkpoint storage (skips if S3 not configured)
+func RunRhaiS3CheckpointMultiGpuTest(t *testing.T, accelerator Accelerator, numNodes, numGpusPerNode int) {
+	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
+	s3Bucket, _ := GetStorageBucketName()
+	if s3Endpoint == "" || s3Bucket == "" {
+		t.Skip("S3 not configured, skipping S3 checkpoint test")
+	}
+
+	runRhaiFeaturesTestWithConfig(t, RhaiFeatureConfig{
+		EnableProgressionTracking: false,
+		EnableJitCheckpoint:       true,
+		UseS3Checkpoints:          true,
+		CheckpointOutputDir:       fmt.Sprintf("s3://%s/checkpoints", s3Bucket),
+		CheckpointSaveStrategy:    "epoch",
+		CheckpointSaveTotalLimit:  "3",
+		Accelerator:               accelerator,
+		NumNodes:                  numNodes,
+		NumGpusPerNode:            numGpusPerNode,
+	})
+}
+
 // runRhaiFeaturesTestWithConfig runs the e2e test with the given feature configuration
 func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 	test := With(t)
@@ -166,7 +316,7 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 
 	// RBACs setup for user (user token is used by notebook for Trainer API calls)
 	userName := common.GetNotebookUserName(test)
-	userToken := common.GenerateNotebookUserToken(test)
+	userToken := common.GetNotebookUserToken(test)
 	CreateUserRoleBindingWithClusterRole(test, userName, namespace.Name, "admin")
 	// ClusterRoleBinding for cluster-scoped resources (ClusterTrainingRuntimes) - minimal get/list/watch access
 	trainerutils.CreateUserClusterRoleBindingForTrainerRuntimes(test, userName)
@@ -181,10 +331,17 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 	installScript, err := os.ReadFile(installScriptPath)
 	test.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("failed to read install script: %s", installScriptPath))
 
-	cm := CreateConfigMap(test, namespace.Name, map[string][]byte{
+	cmData := map[string][]byte{
 		rhaiFeaturesNotebookName: nb,
 		"install_kubeflow.py":    installScript,
-	})
+	}
+	if config.UseS3Checkpoints {
+		// Add cloud checkpoint management utility (handles both --prepare and --cleanup)
+		utilsScript, err := os.ReadFile(cloudCheckpointUtilsPath)
+		test.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("failed to read utils script: %s", cloudCheckpointUtilsPath))
+		cmData[cloudCheckpointUtilsName] = utilsScript
+	}
+	cm := CreateConfigMap(test, namespace.Name, cmData)
 
 	// Create shared RWX PVC for distributed training (HF cache shared across nodes)
 	storageClass, err := GetRWXStorageClass(test)
@@ -242,6 +399,23 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 		test.T().Log("HuggingFace mode: S3 not configured, will download from HF Hub")
 	}
 
+	// Create Data Connection secret for S3 checkpointing (if configured)
+	dataConnectionExports := ""
+	if config.UseS3Checkpoints {
+		dataConnectionSecret := CreateSecret(test, namespace.Name, map[string]string{
+			"AWS_ACCESS_KEY_ID":     s3AccessKey,
+			"AWS_SECRET_ACCESS_KEY": s3SecretKey,
+			"AWS_S3_ENDPOINT":       s3Endpoint,
+		})
+		test.T().Logf("Created Data Connection secret: %s for S3 checkpoint storage", dataConnectionSecret.Name)
+		dataConnectionExports = fmt.Sprintf(
+			"export DATA_CONNECTION_NAME='%s'; "+
+				"export CHECKPOINT_VERIFY_SSL='false'; "+
+				"export KUBEFLOW_INSTALL_FROM_GIT='true'; ",
+			dataConnectionSecret.Name,
+		)
+	}
+
 	// Determine GPU type from Accelerator.ResourceLabel (e.g., "nvidia.com/gpu" → "nvidia")
 	gpuType := config.Accelerator.Type // "cpu" or "gpu"
 	if config.Accelerator.ResourceLabel != "" {
@@ -255,6 +429,7 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 	// Build pip exports - GPU_TYPE tells install_kubeflow.py which Red Hat index to use
 	pipExports := fmt.Sprintf("export GPU_TYPE='%s'; ", gpuType)
 	pipInstallFlags := ""
+	preRunCheckpointSetupCmd := buildPreRunCheckpointSetupCmd(config)
 
 	// Set defaults for num_nodes and num_gpus_per_node if not specified
 	numNodes := config.NumNodes
@@ -283,10 +458,13 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 			"export NUM_NODES='%d'; "+
 			"export NUM_GPUS_PER_NODE='%d'; "+
 			"%s"+ // S3 exports (if configured)
-			"%s"+ // PyPI exports (if configured)
-			"python -m pip install --quiet --no-cache-dir %s papermill && "+
+			"%s"+ // Data Connection exports (if configured)
+			"%s"+ // PyPI/GPU_TYPE exports
+			"python -m pip install --quiet --no-cache-dir %s papermill ipykernel boto3==1.34.162 && "+
+			"%s"+ // Optional pre-run checkpoint storage setup (S3 cleanup for S3 tests)
 			"python /opt/app-root/notebooks/install_kubeflow.py && "+
-			"python -m papermill -k python3 /opt/app-root/notebooks/%s /opt/app-root/src/out.ipynb --log-output; "+
+			"python -m ipykernel install --user --name=python3 && "+
+			"python -m papermill /opt/app-root/notebooks/%s /opt/app-root/src/out.ipynb --log-output; "+
 			"sleep infinity",
 		GetOpenShiftApiUrl(test), userToken, namespace.Name, sharedPVC.Name,
 		enableProgression,
@@ -299,8 +477,10 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 		numNodes,
 		numGpusPerNode,
 		s3Exports,
+		dataConnectionExports,
 		pipExports,
 		pipInstallFlags,
+		preRunCheckpointSetupCmd,
 		rhaiFeaturesNotebookName,
 	)
 
@@ -313,6 +493,11 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 
 	// Cleanup - use longer timeout due to large runtime images
 	defer func() {
+		// Clean up cloud storage checkpoints if using cloud storage
+		if config.UseS3Checkpoints {
+			cleanupCloudCheckpoints(test, namespace.Name, config.CheckpointOutputDir)
+		}
+		// Clean up Kubernetes resources
 		common.DeleteNotebook(test, namespace)
 		test.Eventually(common.Notebooks(test, namespace), TestTimeoutGpuProvisioning).Should(HaveLen(0))
 	}()
@@ -371,12 +556,36 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 			"Expected metrics-poll-interval annotation to be '8'")
 		test.T().Log("metrics-poll-interval annotation is '8'")
 
-		// Verify trainerStatus annotation contains valid JSON with expected fields
+		// Wait for trainerStatus annotation to reach 100% after completion
+		// This fixes a race condition where the operator might not have updated
+		// the annotation with the final progress before the test reads it.
+		// The operator polls every 8 seconds, so 1-2 minutes should be sufficient.
+		test.T().Log("Waiting for trainerStatus annotation to reach 100%...")
+		var trainerStatus map[string]interface{}
+		test.Eventually(func() float64 {
+			trainJob := TrainJob(test, namespace.Name, trainJobName)(test)
+			annotations := trainJob.GetAnnotations()
+			trainerStatusRaw := annotations[annotationTrainerStatus]
+			if trainerStatusRaw == "" {
+				return 0
+			}
+			if err := json.Unmarshal([]byte(trainerStatusRaw), &trainerStatus); err != nil {
+				return 0
+			}
+			if progress, ok := trainerStatus["progressPercentage"].(float64); ok {
+				return progress
+			}
+			return 0
+		}, TestTimeoutMedium, 5*time.Second).Should(BeNumerically("==", 100),
+			"Progress should reach 100% in trainerStatus annotation after completion")
+
+		// Get final TrainJob to verify all fields
+		trainJob := TrainJob(test, namespace.Name, trainJobName)(test)
+		annotations = trainJob.GetAnnotations()
 		trainerStatusRaw := annotations[annotationTrainerStatus]
 		test.Expect(trainerStatusRaw).NotTo(BeEmpty(), "trainerStatus annotation should not be empty")
 
-		var trainerStatus map[string]interface{}
-		err = json.Unmarshal([]byte(trainerStatusRaw), &trainerStatus)
+		err := json.Unmarshal([]byte(trainerStatusRaw), &trainerStatus)
 		test.Expect(err).NotTo(HaveOccurred(), "trainerStatus should be valid JSON")
 		test.T().Logf("trainerStatus: %s", trainerStatusRaw)
 
@@ -541,13 +750,45 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 	}, timeout, 5*time.Second).Should(Equal(2), "Expected exactly 2 training pods to be running")
 	test.T().Log("Training pods are running")
 
-	// Wait for training to complete at least 1 epoch (detected from logs)
-	// HuggingFace Trainer logs epoch completion with patterns like "'epoch': 1.0" or "Epoch 1"
-	test.T().Log("Waiting for training to complete at least 1 epoch (checking logs)...")
+	// Wait for at least 2 epochs before suspending.
+	// This ensures there's a complete previous checkpoint to fall back to when the
+	// JIT checkpoint gets .incomplete marker (epoch 1 checkpoint is fully saved/uploaded).
+	test.T().Log("Waiting for training to complete at least 2 epochs (checking logs)...")
 	test.Eventually(func() bool {
-		return hasCompletedEpochFromLogs(test, namespace, trainJobName)
-	}, TestTimeoutMedium, 5*time.Second).Should(BeTrue(), "Training should complete at least 1 epoch before suspension")
-	test.T().Log("At least 1 epoch completed - ready to suspend")
+		return hasCompletedEpochFromLogs(test, namespace, trainJobName, epochPattern, 2)
+	}, TestTimeoutMedium, 5*time.Second).Should(BeTrue(), "Training should complete at least 2 epochs before suspension")
+	test.T().Log("At least 2 epochs completed - ready to suspend")
+
+	// Verify cloud checkpoint upload is working (only for cloud storage mode)
+	// This catches SDK monkey-patch failures early - if save_strategy override didn't apply,
+	// no checkpoints are saved and no uploads happen
+	if strings.Contains(checkpointDir, "://") {
+		test.T().Log("Step 1b: Verifying cloud checkpoint upload is working...")
+		test.Eventually(func() bool {
+			for _, pod := range listTrainingPods(test, namespace, trainJobName) {
+				if pod.Status.Phase != corev1.PodRunning {
+					continue
+				}
+				logs := PodLog(test, namespace, pod.Name, corev1.PodLogOptions{Container: "node"})(test)
+				// Check SDK applied the save_strategy override (monkey-patch working)
+				if !strings.Contains(logs, "[Kubeflow] Applied save_strategy:") {
+					test.T().Log("Waiting for SDK save_strategy override to appear in logs...")
+					return false
+				}
+				// Check at least one checkpoint was uploaded to cloud storage
+				if strings.Contains(logs, "[Kubeflow] Upload complete:") {
+					test.T().Log("Cloud checkpoint upload confirmed in pod logs")
+					return true
+				}
+			}
+			return false
+		}, TestTimeoutMedium, 5*time.Second).Should(BeTrue(),
+			"Cloud checkpoint upload not detected in training pod logs. "+
+				"Expected '[Kubeflow] Upload complete:' after epoch completion. "+
+				"This usually means the SDK's checkpoint config override (save_strategy, output_dir) "+
+				"was not applied to the Trainer. Check full training pod logs for '[Kubeflow]' messages.")
+		test.T().Log("Cloud checkpoint upload verified - periodic checkpoints are being saved to cloud storage")
+	}
 
 	// Step 2: Suspend the TrainJob to trigger JIT checkpoint save
 	test.T().Log("Step 2: Suspending TrainJob to trigger checkpoint save...")
@@ -649,7 +890,7 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 
 	// Step 9: Verify logs show checkpoint was loaded
 	test.T().Log("Step 9: Verifying checkpoint was loaded from logs...")
-	verifyCheckpointLoadedFromLogs(test, namespace, trainJobName)
+	verifyCheckpointLoadedFromLogs(test, namespace, trainJobName, checkpointDir)
 
 	test.T().Log("JIT checkpoint verification completed successfully!")
 }
@@ -750,24 +991,25 @@ func listTrainingPods(test Test, namespace, trainJobName string) []corev1.Pod {
 	return pods
 }
 
-// hasCompletedEpochFromLogs checks if training has completed at least 1 epoch by examining pod logs
-// HuggingFace Trainer logs: {'loss': X, ..., 'epoch': 1.0} - epochPattern matches epoch >= 1
-func hasCompletedEpochFromLogs(test Test, namespace, trainJobName string) bool {
+// hasCompletedEpochFromLogs checks if training has completed the required number of epochs by examining pod logs
+// HuggingFace Trainer logs: {'loss': X, ..., 'epoch': 1.0} - pattern matches the target epoch
+func hasCompletedEpochFromLogs(test Test, namespace, trainJobName string, pattern *regexp.Regexp, minEpoch int) bool {
 	for _, pod := range listTrainingPods(test, namespace, trainJobName) {
 		if pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
 		logs := PodLog(test, namespace, pod.Name, corev1.PodLogOptions{Container: "node"})(test)
-		if epochPattern.MatchString(logs) {
-			test.T().Logf("Epoch >= 1 detected in pod %s logs", pod.Name)
+		if pattern.MatchString(logs) {
+			test.T().Logf("Epoch >= %d detected in pod %s logs", minEpoch, pod.Name)
 			return true
 		}
 	}
 	return false
 }
 
-// verifyCheckpointLoadedFromLogs checks pod logs for checkpoint resume messages from Kubeflow SDK
-func verifyCheckpointLoadedFromLogs(test Test, namespace, trainJobName string) {
+// verifyCheckpointLoadedFromLogs checks pod logs for checkpoint resume messages from Kubeflow SDK.
+// Uses mode-specific indicators: legacy local resume logs for PVC, cloud download logs for cloud storage.
+func verifyCheckpointLoadedFromLogs(test Test, namespace, trainJobName, checkpointDir string) {
 	test.T().Helper()
 
 	pods := listTrainingPods(test, namespace, trainJobName)
@@ -775,6 +1017,9 @@ func verifyCheckpointLoadedFromLogs(test Test, namespace, trainJobName string) {
 
 	// Checkpoint resume indicators from Kubeflow SDK (transformers.py)
 	indicators := []string{"[Kubeflow] Found latest checkpoint:", "[Kubeflow] Auto-resuming from:"}
+	if strings.Contains(checkpointDir, "://") {
+		indicators = []string{"[Kubeflow] Downloading checkpoint:", "[Kubeflow] Download complete"}
+	}
 
 	for _, pod := range pods {
 		if pod.Status.Phase != corev1.PodSucceeded {
@@ -789,5 +1034,5 @@ func verifyCheckpointLoadedFromLogs(test Test, namespace, trainJobName string) {
 		}
 	}
 
-	test.T().Fatal("Checkpoint resume log not found in any completed pod (expected '[Kubeflow] Auto-resuming from:')")
+	test.T().Fatalf("Checkpoint resume log not found in any completed pod (expected one of: %v)", indicators)
 }
