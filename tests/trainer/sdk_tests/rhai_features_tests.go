@@ -63,15 +63,128 @@ func boolStr(b bool) string {
 	return "false"
 }
 
+// parseURIScheme extracts the scheme from a URI (e.g., "s3://bucket/path" -> "s3")
+func parseURIScheme(uri string) string {
+	if idx := strings.Index(uri, "://"); idx > 0 {
+		return uri[:idx]
+	}
+	return ""
+}
+
+// getS3EnvVars retrieves S3 environment variables for the given checkpoint URI
+func getS3EnvVars(checkpointURI string) map[string]string {
+	endpoint, _ := GetStorageBucketDefaultEndpoint()
+	accessKey, _ := GetStorageBucketAccessKeyId()
+	secretKey, _ := GetStorageBucketSecretKey()
+
+	if endpoint == "" || accessKey == "" || secretKey == "" {
+		return nil // S3 not configured
+	}
+
+	return map[string]string{
+		"CHECKPOINT_OUTPUT_DIR": checkpointURI,
+		"AWS_DEFAULT_ENDPOINT":  endpoint,
+		"AWS_ACCESS_KEY_ID":     accessKey,
+		"AWS_SECRET_ACCESS_KEY": secretKey,
+	}
+}
+
+// getCloudStorageEnvVars returns environment variables for cloud storage cleanup
+// based on the checkpoint URI scheme. Returns nil if not a cloud storage URI or not configured.
+// Easy to extend: add cases for "azure", "gs" (GCS), etc.
+func getCloudStorageEnvVars(checkpointURI string) map[string]string {
+	scheme := parseURIScheme(checkpointURI)
+
+	switch scheme {
+	case "s3":
+		return getS3EnvVars(checkpointURI)
+	// Future: add cases for other cloud providers
+	// case "azure":
+	//     return getAzureEnvVars(checkpointURI)
+	// case "gs":
+	//     return getGCSEnvVars(checkpointURI)
+	default:
+		return nil // Not a cloud storage URI (e.g., PVC path)
+	}
+}
+
+// isCloudStorageURI checks if the given URI is a cloud storage URI (has a scheme like s3://, azure://, etc.)
+func isCloudStorageURI(uri string) bool {
+	return parseURIScheme(uri) != ""
+}
+
+// createCloudStorageDataConnection creates a Kubernetes Data Connection secret for cloud checkpointing
+// and returns the export string for environment variables. Returns empty string if not configured.
+// Accepts pre-retrieved credentials to avoid duplicate retrieval. If credentials are nil, retrieves them.
+// Provider-agnostic: automatically detects scheme (s3://, azure://, etc.). Easy to extend for new cloud providers.
+func createCloudStorageDataConnection(test Test, namespace string, checkpointURI string, envVars map[string]string) string {
+	scheme := parseURIScheme(checkpointURI)
+	if scheme == "" {
+		return "" // Not a cloud storage URI
+	}
+
+	// Use provided credentials if available, otherwise retrieve them
+	if envVars == nil {
+		envVars = getCloudStorageEnvVars(checkpointURI)
+		if envVars == nil {
+			return "" // Credentials not configured
+		}
+	}
+
+	// Transform env vars to Data Connection secret format based on URI scheme
+	var secretData map[string]string
+
+	switch scheme {
+	case "s3":
+		secretData = map[string]string{
+			"AWS_ACCESS_KEY_ID":     envVars["AWS_ACCESS_KEY_ID"],
+			"AWS_SECRET_ACCESS_KEY": envVars["AWS_SECRET_ACCESS_KEY"],
+			"AWS_S3_ENDPOINT":       envVars["AWS_DEFAULT_ENDPOINT"],
+		}
+		// Add all optional fields that are available (use whatever is provided in envVars)
+		// Map AWS_STORAGE_BUCKET from s3Exports to AWS_S3_BUCKET (SDK expects AWS_S3_BUCKET)
+		if bucket, ok := envVars["AWS_STORAGE_BUCKET"]; ok && bucket != "" {
+			secretData["AWS_S3_BUCKET"] = bucket
+		}
+	// Future: add cases for other cloud providers
+	// case "azure":
+	//     secretData = map[string]string{
+	//         "AZURE_STORAGE_ACCOUNT": envVars["AZURE_STORAGE_ACCOUNT"],
+	//         "AZURE_STORAGE_KEY":     envVars["AZURE_STORAGE_KEY"],
+	//         "AZURE_STORAGE_ENDPOINT": envVars["AZURE_DEFAULT_ENDPOINT"],
+	//     }
+	// case "gs": // Google Cloud Storage
+	//     secretData = map[string]string{
+	//         "GCS_BUCKET": envVars["GCS_BUCKET"],
+	//         "GOOGLE_APPLICATION_CREDENTIALS": envVars["GOOGLE_APPLICATION_CREDENTIALS"],
+	//     }
+	default:
+		return "" // Unsupported scheme
+	}
+
+	dataConnectionSecret := CreateSecret(test, namespace, secretData)
+	test.T().Logf("Created Data Connection secret: %s for cloud checkpoint storage", dataConnectionSecret.Name)
+
+	return fmt.Sprintf(
+		"export DATA_CONNECTION_NAME='%s'; "+
+			"export CHECKPOINT_VERIFY_SSL='false'; "+
+			"export KUBEFLOW_INSTALL_FROM_GIT='true'; ",
+		dataConnectionSecret.Name,
+	)
+}
+
 // cleanupCloudCheckpoints deletes all checkpoint files from cloud storage after test completion
 // Delegates all validation and execution to the Python utility script
+// Supports multiple cloud providers via getCloudStorageEnvVars()
 func cleanupCloudCheckpoints(test Test, namespace, checkpointURI string) {
 	test.T().Logf("Starting cloud checkpoint cleanup for: %s", checkpointURI)
 
-	// Get S3 credentials from environment
-	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
-	s3AccessKey, _ := GetStorageBucketAccessKeyId()
-	s3SecretKey, _ := GetStorageBucketSecretKey()
+	// Get cloud storage environment variables based on URI scheme
+	envVars := getCloudStorageEnvVars(checkpointURI)
+	if envVars == nil {
+		test.T().Logf("Not a cloud storage URI or credentials not configured, skipping cleanup: %s", checkpointURI)
+		return
+	}
 
 	// Find the notebook pod to exec the cleanup script
 	allPods, err := test.Client().Core().CoreV1().Pods(namespace).List(
@@ -96,15 +209,12 @@ func cleanupCloudCheckpoints(test Test, namespace, checkpointURI string) {
 		return
 	}
 
-	// Build cleanup command with environment variables
-	cleanupCmd := fmt.Sprintf(
-		"export CHECKPOINT_OUTPUT_DIR='%s' && "+
-			"export AWS_DEFAULT_ENDPOINT='%s' && "+
-			"export AWS_ACCESS_KEY_ID='%s' && "+
-			"export AWS_SECRET_ACCESS_KEY='%s' && "+
-			"python /opt/app-root/notebooks/%s --cleanup",
-		checkpointURI, s3Endpoint, s3AccessKey, s3SecretKey, cloudCheckpointUtilsName,
-	)
+	// Build cleanup command with cloud provider-specific environment variables
+	var envExports []string
+	for key, value := range envVars {
+		envExports = append(envExports, fmt.Sprintf("export %s='%s'", key, value))
+	}
+	cleanupCmd := strings.Join(envExports, " && ") + fmt.Sprintf(" && python /opt/app-root/notebooks/%s --cleanup", cloudCheckpointUtilsName)
 
 	// Execute cleanup script in notebook pod (best effort)
 	var stdout, stderr bytes.Buffer
@@ -157,11 +267,12 @@ func execInPod(test Test, namespace, podName, containerName string, command []st
 
 // buildPreRunCheckpointSetupCmd returns optional command snippet to prepare
 // checkpoint storage before notebook execution (cleanup for cloud checkpoint tests).
+// Checks if checkpoint URI is cloud storage (not PVC) to determine if setup is needed.
 func buildPreRunCheckpointSetupCmd(config RhaiFeatureConfig) string {
-	if !config.UseS3Checkpoints {
-		return ""
+	if !isCloudStorageURI(config.CheckpointOutputDir) {
+		return "" // PVC doesn't need pre-run setup
 	}
-	// Best effort only: never fail test execution because of pre-cleanup.
+	// Cloud storage needs pre-run setup (best effort only: never fail test execution)
 	return fmt.Sprintf("python /opt/app-root/notebooks/%s --prepare || true; ", cloudCheckpointUtilsName)
 }
 
@@ -175,7 +286,6 @@ type RhaiFeatureConfig struct {
 	Accelerator               Accelerator // CPU, NVIDIA, or AMD
 	NumNodes                  int         // Number of training nodes (default: 2)
 	NumGpusPerNode            int         // GPUs per node for multi-GPU tests (default: 1)
-	UseS3Checkpoints          bool        // Use S3 for checkpoint storage (creates Data Connection secret)
 }
 
 // RunRhaiFeaturesProgressionTest runs the e2e test for RHAI features with progression tracking
@@ -273,7 +383,6 @@ func RunRhaiS3CheckpointTest(t *testing.T, accelerator Accelerator) {
 	runRhaiFeaturesTestWithConfig(t, RhaiFeatureConfig{
 		EnableProgressionTracking: false,
 		EnableJitCheckpoint:       true,
-		UseS3Checkpoints:          true,
 		CheckpointOutputDir:       fmt.Sprintf("s3://%s/checkpoints", s3Bucket),
 		CheckpointSaveStrategy:    "epoch",
 		CheckpointSaveTotalLimit:  "3",
@@ -294,7 +403,6 @@ func RunRhaiS3CheckpointMultiGpuTest(t *testing.T, accelerator Accelerator, numN
 	runRhaiFeaturesTestWithConfig(t, RhaiFeatureConfig{
 		EnableProgressionTracking: false,
 		EnableJitCheckpoint:       true,
-		UseS3Checkpoints:          true,
 		CheckpointOutputDir:       fmt.Sprintf("s3://%s/checkpoints", s3Bucket),
 		CheckpointSaveStrategy:    "epoch",
 		CheckpointSaveTotalLimit:  "3",
@@ -335,7 +443,8 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 		rhaiFeaturesNotebookName: nb,
 		"install_kubeflow.py":    installScript,
 	}
-	if config.UseS3Checkpoints {
+	// Add cloud checkpoint management utility if using cloud storage (not PVC)
+	if isCloudStorageURI(config.CheckpointOutputDir) {
 		// Add cloud checkpoint management utility (handles both --prepare and --cleanup)
 		utilsScript, err := os.ReadFile(cloudCheckpointUtilsPath)
 		test.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("failed to read utils script: %s", cloudCheckpointUtilsPath))
@@ -399,21 +508,32 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 		test.T().Log("HuggingFace mode: S3 not configured, will download from HF Hub")
 	}
 
-	// Create Data Connection secret for S3 checkpointing (if configured)
-	dataConnectionExports := ""
-	if config.UseS3Checkpoints {
-		dataConnectionSecret := CreateSecret(test, namespace.Name, map[string]string{
-			"AWS_ACCESS_KEY_ID":     s3AccessKey,
-			"AWS_SECRET_ACCESS_KEY": s3SecretKey,
-			"AWS_S3_ENDPOINT":       s3Endpoint,
-		})
-		test.T().Logf("Created Data Connection secret: %s for S3 checkpoint storage", dataConnectionSecret.Name)
-		dataConnectionExports = fmt.Sprintf(
-			"export DATA_CONNECTION_NAME='%s'; "+
-				"export CHECKPOINT_VERIFY_SSL='false'; "+
-				"export KUBEFLOW_INSTALL_FROM_GIT='true'; ",
-			dataConnectionSecret.Name,
-		)
+	// Create Data Connection secret for cloud checkpointing (if configured)
+	// Automatically detects cloud storage from URI scheme (s3://, azure://, etc.)
+	// Reuse credentials already retrieved for s3Exports to avoid duplicate retrieval
+	var dataConnectionExports string
+	if isCloudStorageURI(config.CheckpointOutputDir) {
+		// Build envVars from already-retrieved credentials to avoid duplicate retrieval
+		scheme := parseURIScheme(config.CheckpointOutputDir)
+		var envVars map[string]string
+		if scheme == "s3" && s3Endpoint != "" && s3AccessKey != "" && s3SecretKey != "" {
+			envVars = map[string]string{
+				"CHECKPOINT_OUTPUT_DIR": config.CheckpointOutputDir,
+				"AWS_DEFAULT_ENDPOINT":  s3Endpoint,
+				"AWS_ACCESS_KEY_ID":     s3AccessKey,
+				"AWS_SECRET_ACCESS_KEY": s3SecretKey,
+			}
+			// Add all S3 credentials that are exported in s3Exports
+			if s3Bucket != "" {
+				envVars["AWS_STORAGE_BUCKET"] = s3Bucket
+			}
+		}
+		dataConnectionExports = createCloudStorageDataConnection(test, namespace.Name, config.CheckpointOutputDir, envVars)
+		if dataConnectionExports != "" {
+			test.T().Logf("Data Connection configured for cloud checkpointing: %s", config.CheckpointOutputDir)
+		} else {
+			test.T().Logf("Warning: Cloud storage URI detected (%s) but Data Connection not created (credentials may be missing)", config.CheckpointOutputDir)
+		}
 	}
 
 	// Determine GPU type from Accelerator.ResourceLabel (e.g., "nvidia.com/gpu" → "nvidia")
@@ -493,8 +613,8 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 
 	// Cleanup - use longer timeout due to large runtime images
 	defer func() {
-		// Clean up cloud storage checkpoints if using cloud storage
-		if config.UseS3Checkpoints {
+		// Clean up cloud storage checkpoints if using cloud storage (check URI, not just flag)
+		if isCloudStorageURI(config.CheckpointOutputDir) {
 			cleanupCloudCheckpoints(test, namespace.Name, config.CheckpointOutputDir)
 		}
 		// Clean up Kubernetes resources
