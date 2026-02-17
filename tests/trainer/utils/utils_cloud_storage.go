@@ -117,9 +117,10 @@ func (p *S3Provider) getS3Client() (*minio.Client, error) {
 	// Extract host:port from URL (remove http:// or https://)
 	endpoint := strings.TrimPrefix(strings.TrimPrefix(endpointURL, "https://"), "http://")
 
-	// Check if SSL verification should be skipped (for self-signed certificates)
-	// Respect CHECKPOINT_VERIFY_SSL or VERIFY_SSL environment variable (default: false for test infrastructure)
-	verifySSL := true
+	// Configure TLS verification based on environment variables
+	// CHECKPOINT_VERIFY_SSL or VERIFY_SSL can be set to "true" to enable certificate verification
+	// Defaults to false to support test environments with self-signed certificates
+	verifySSL := false
 	if verifySSLEnv := os.Getenv("CHECKPOINT_VERIFY_SSL"); verifySSLEnv != "" {
 		if val, err := strconv.ParseBool(verifySSLEnv); err == nil {
 			verifySSL = val
@@ -128,15 +129,11 @@ func (p *S3Provider) getS3Client() (*minio.Client, error) {
 		if val, err := strconv.ParseBool(verifySSLEnv); err == nil {
 			verifySSL = val
 		}
-	} else {
-		// Default to false for test infrastructure (test MinIO typically has self-signed certs)
-		verifySSL = false
 	}
 
 	var tr *http.Transport
 	if !verifySSL {
-		// Configure HTTP transport to skip TLS verification (for self-signed certificates)
-		// This matches the Python script's verify=False behavior
+		// Skip TLS verification for test environments with self-signed certificates
 		tr = &http.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
@@ -238,8 +235,10 @@ func getCloudStorageProvider(scheme string) (CloudStorageProvider, error) {
 	}
 }
 
-// PrepareCloudCheckpointStorage prepares cloud checkpoint storage (delete old + create .keep).
-// Returns error if preparation fails. Best effort - should not fail tests.
+// PrepareCloudCheckpointStorage prepares cloud checkpoint storage by deleting old objects
+// and creating a .keep file to ensure the prefix exists.
+// Returns nil on success or if the URI is not cloud storage. Errors are logged but
+// do not cause test failures, allowing tests to continue even if storage operations fail.
 func PrepareCloudCheckpointStorage(test Test, checkpointURI string) error {
 	test.T().Helper()
 
@@ -251,21 +250,23 @@ func PrepareCloudCheckpointStorage(test Test, checkpointURI string) error {
 	provider, err := getCloudStorageProvider(uri.Scheme)
 	if err != nil {
 		test.T().Logf("Cloud checkpoint prep: skip (%v)", err)
-		return nil // Best effort - don't fail test
+		return nil
 	}
 
 	ctx := test.Ctx()
 	if err := provider.PrepareStorage(ctx, uri); err != nil {
 		test.T().Logf("Cloud checkpoint prep warning: %v", err)
-		return nil // Best effort - don't fail test
+		return nil
 	}
 
 	test.T().Logf("Cloud checkpoint prep complete: cleaned and created %s://%s/%s/.keep", uri.Scheme, uri.Bucket, uri.Prefix)
 	return nil
 }
 
-// CleanupCloudCheckpointStorage cleans up cloud checkpoint storage (delete all objects).
-// Returns number of objects deleted. Best effort - should not fail tests.
+// CleanupCloudCheckpointStorage cleans up cloud checkpoint storage by deleting all objects
+// under the specified prefix. Returns the number of objects deleted.
+// Errors are logged but do not cause test failures, allowing tests to continue even if
+// cleanup operations fail.
 func CleanupCloudCheckpointStorage(test Test, checkpointURI string) int {
 	test.T().Helper()
 

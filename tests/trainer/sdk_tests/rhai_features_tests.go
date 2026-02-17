@@ -319,7 +319,8 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 	checkpointScheme := parseURIScheme(config.CheckpointOutputDir)
 	cm := CreateConfigMap(test, namespace.Name, cmData)
 
-	// Prepare cloud checkpoint storage before creating notebook (best effort - won't fail test)
+	// Prepare cloud checkpoint storage before creating notebook
+	// Errors are logged but do not cause test failures
 	if checkpointScheme != "" {
 		trainerutils.PrepareCloudCheckpointStorage(test, config.CheckpointOutputDir)
 	}
@@ -544,10 +545,9 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 			"Expected metrics-poll-interval annotation to be '8'")
 		test.T().Log("metrics-poll-interval annotation is '8'")
 
-		// Wait for trainerStatus annotation to reach 100% after completion
-		// This fixes a race condition where the operator might not have updated
-		// the annotation with the final progress before the test reads it.
-		// The operator polls every 8 seconds, so 1-2 minutes should be sufficient.
+		// Wait for trainerStatus annotation to reach 100% after completion.
+		// The operator polls metrics every 8 seconds and updates annotations asynchronously,
+		// so we wait to ensure the final progress is reflected before verification.
 		test.T().Log("Waiting for trainerStatus annotation to reach 100%...")
 		var trainerStatus map[string]interface{}
 		test.Eventually(func() float64 {
@@ -789,7 +789,8 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 	}, TestTimeoutMedium, 5*time.Second).Should(Equal(0), "All training pods should terminate after suspend")
 	test.T().Log("All training pods terminated - checkpoint should be saved")
 
-	// Step 4: Verify job is suspended and NOT already completed (race condition check)
+	// Step 4: Verify job is suspended and not already completed
+	// This ensures the suspend operation took effect before training finished
 	test.T().Log("Step 4: Verifying job is suspended (not completed)...")
 	trainJob := TrainJob(test, namespace, trainJobName)(test)
 	if TrainJobConditionComplete(trainJob) == metav1.ConditionTrue {
@@ -802,8 +803,8 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 	var preSuspendProgress int
 	var preSuspendEpoch float64
 	if progressionEnabled {
-		// Wait for operator to poll metrics and update TrainJob annotations
-		// This avoids race condition where job is suspended before progress is tracked
+		// Wait for operator to poll metrics and update TrainJob annotations.
+		// This ensures progress is recorded before suspending the job.
 		test.T().Log("Step 5: Waiting for progress to be tracked in TrainJob...")
 		test.Eventually(func() int {
 			return getProgressPercentage(test, namespace, trainJobName)
