@@ -17,7 +17,6 @@ limitations under the License.
 package sdk_tests
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -31,8 +30,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/remotecommand"
 
 	common "github.com/opendatahub-io/distributed-workloads/tests/common"
 	. "github.com/opendatahub-io/distributed-workloads/tests/common/support"
@@ -42,8 +39,6 @@ import (
 const (
 	rhaiFeaturesNotebookName = "rhai_features.ipynb"
 	rhaiFeaturesNotebookPath = "resources/" + rhaiFeaturesNotebookName
-	cloudCheckpointUtilsPath = "resources/cloud_checkpoint_utils.py"
-	cloudCheckpointUtilsName = "cloud_checkpoint_utils.py"
 
 	// Annotation keys for progression tracking (must match SDK/training-operator constants)
 	annotationProgressionTracking = "trainer.opendatahub.io/progression-tracking"
@@ -98,19 +93,10 @@ func getCloudStorageEnvVars(checkpointURI string) map[string]string {
 	switch scheme {
 	case "s3":
 		return getS3EnvVars(checkpointURI)
-	// Future: add cases for other cloud providers
-	// case "azure":
-	//     return getAzureEnvVars(checkpointURI)
-	// case "gs":
-	//     return getGCSEnvVars(checkpointURI)
+	// Future: add cases for other cloud providers (Azure, GCS, etc.)
 	default:
 		return nil // Not a cloud storage URI (e.g., PVC path)
 	}
-}
-
-// isCloudStorageURI checks if the given URI is a cloud storage URI (has a scheme like s3://, azure://, etc.)
-func isCloudStorageURI(uri string) bool {
-	return parseURIScheme(uri) != ""
 }
 
 // createCloudStorageDataConnection creates a Kubernetes Data Connection secret for cloud checkpointing
@@ -146,18 +132,7 @@ func createCloudStorageDataConnection(test Test, namespace string, checkpointURI
 		if bucket, ok := envVars["AWS_STORAGE_BUCKET"]; ok && bucket != "" {
 			secretData["AWS_S3_BUCKET"] = bucket
 		}
-	// Future: add cases for other cloud providers
-	// case "azure":
-	//     secretData = map[string]string{
-	//         "AZURE_STORAGE_ACCOUNT": envVars["AZURE_STORAGE_ACCOUNT"],
-	//         "AZURE_STORAGE_KEY":     envVars["AZURE_STORAGE_KEY"],
-	//         "AZURE_STORAGE_ENDPOINT": envVars["AZURE_DEFAULT_ENDPOINT"],
-	//     }
-	// case "gs": // Google Cloud Storage
-	//     secretData = map[string]string{
-	//         "GCS_BUCKET": envVars["GCS_BUCKET"],
-	//         "GOOGLE_APPLICATION_CREDENTIALS": envVars["GOOGLE_APPLICATION_CREDENTIALS"],
-	//     }
+	// Future: add cases for other cloud providers (Azure, GCS, etc.)
 	default:
 		return "" // Unsupported scheme
 	}
@@ -171,109 +146,6 @@ func createCloudStorageDataConnection(test Test, namespace string, checkpointURI
 			"export KUBEFLOW_INSTALL_FROM_GIT='true'; ",
 		dataConnectionSecret.Name,
 	)
-}
-
-// cleanupCloudCheckpoints deletes all checkpoint files from cloud storage after test completion
-// Delegates all validation and execution to the Python utility script
-// Supports multiple cloud providers via getCloudStorageEnvVars()
-func cleanupCloudCheckpoints(test Test, namespace, checkpointURI string) {
-	test.T().Logf("Starting cloud checkpoint cleanup for: %s", checkpointURI)
-
-	// Get cloud storage environment variables based on URI scheme
-	envVars := getCloudStorageEnvVars(checkpointURI)
-	if envVars == nil {
-		test.T().Logf("Not a cloud storage URI or credentials not configured, skipping cleanup: %s", checkpointURI)
-		return
-	}
-
-	// Find the notebook pod to exec the cleanup script
-	allPods, err := test.Client().Core().CoreV1().Pods(namespace).List(
-		test.Ctx(),
-		metav1.ListOptions{},
-	)
-	if err != nil {
-		test.T().Logf("Failed to list pods for cleanup: %v", err)
-		return
-	}
-
-	var notebookPod *corev1.Pod
-	for _, pod := range allPods.Items {
-		if strings.HasPrefix(pod.Name, "jupyter-nb-") && pod.Status.Phase == corev1.PodRunning {
-			notebookPod = &pod
-			break
-		}
-	}
-
-	if notebookPod == nil {
-		test.T().Log("No running notebook pod found for cleanup, skipping")
-		return
-	}
-
-	// Build cleanup command with cloud provider-specific environment variables
-	var envExports []string
-	for key, value := range envVars {
-		envExports = append(envExports, fmt.Sprintf("export %s='%s'", key, value))
-	}
-	cleanupCmd := strings.Join(envExports, " && ") + fmt.Sprintf(" && python /opt/app-root/notebooks/%s --cleanup", cloudCheckpointUtilsName)
-
-	// Execute cleanup script in notebook pod (best effort)
-	var stdout, stderr bytes.Buffer
-	execErr := execInPod(test, namespace, notebookPod.Name, "jupyter-nb-kube-3aadmin", []string{"/bin/sh", "-c", cleanupCmd}, &stdout, &stderr)
-
-	if execErr != nil {
-		test.T().Logf("Cloud checkpoint cleanup completed with warnings: %v", execErr)
-		if stderr.Len() > 0 {
-			test.T().Logf("Cleanup stderr: %s", stderr.String())
-		}
-	} else {
-		test.T().Log("Cloud checkpoint cleanup successful")
-		if stdout.Len() > 0 {
-			test.T().Logf("Cleanup output: %s", stdout.String())
-		}
-	}
-}
-
-// execInPod executes a command in a pod container using the remotecommand API
-func execInPod(test Test, namespace, podName, containerName string, command []string, stdout, stderr *bytes.Buffer) error {
-	test.T().Helper()
-
-	req := test.Client().Core().CoreV1().RESTClient().Post().
-		Resource("pods").
-		Name(podName).
-		Namespace(namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: containerName,
-			Command:   command,
-			Stdout:    true,
-			Stderr:    true,
-		}, scheme.ParameterCodec)
-
-	exec, err := remotecommand.NewSPDYExecutor(test.Config(), "POST", req.URL())
-	if err != nil {
-		return fmt.Errorf("failed to create executor: %w", err)
-	}
-
-	err = exec.StreamWithContext(test.Ctx(), remotecommand.StreamOptions{
-		Stdout: stdout,
-		Stderr: stderr,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to exec command: %w", err)
-	}
-
-	return nil
-}
-
-// buildPreRunCheckpointSetupCmd returns optional command snippet to prepare
-// checkpoint storage before notebook execution (cleanup for cloud checkpoint tests).
-// Checks if checkpoint URI is cloud storage (not PVC) to determine if setup is needed.
-func buildPreRunCheckpointSetupCmd(config RhaiFeatureConfig) string {
-	if !isCloudStorageURI(config.CheckpointOutputDir) {
-		return "" // PVC doesn't need pre-run setup
-	}
-	// Cloud storage needs pre-run setup (best effort only: never fail test execution)
-	return fmt.Sprintf("python /opt/app-root/notebooks/%s --prepare || true; ", cloudCheckpointUtilsName)
 }
 
 // RhaiFeatureConfig holds configuration for RHAI feature tests
@@ -372,12 +244,12 @@ func RunRhaiFeaturesAllMultiGpuTest(t *testing.T, accelerator Accelerator, numNo
 	})
 }
 
-// RunRhaiS3CheckpointTest runs the e2e test for S3 checkpoint storage (skips if S3 not configured)
+// RunRhaiS3CheckpointTest runs the e2e test for S3 checkpoint storage (requires S3 configuration)
 func RunRhaiS3CheckpointTest(t *testing.T, accelerator Accelerator) {
 	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
 	s3Bucket, _ := GetStorageBucketName()
 	if s3Endpoint == "" || s3Bucket == "" {
-		t.Skip("S3 not configured, skipping S3 checkpoint test")
+		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set all required S3 environment variables (AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_STORAGE_BUCKET)")
 	}
 
 	runRhaiFeaturesTestWithConfig(t, RhaiFeatureConfig{
@@ -392,12 +264,12 @@ func RunRhaiS3CheckpointTest(t *testing.T, accelerator Accelerator) {
 	})
 }
 
-// RunRhaiS3CheckpointMultiGpuTest runs multi-GPU test for S3 checkpoint storage (skips if S3 not configured)
+// RunRhaiS3CheckpointMultiGpuTest runs multi-GPU test for S3 checkpoint storage (requires S3 configuration)
 func RunRhaiS3CheckpointMultiGpuTest(t *testing.T, accelerator Accelerator, numNodes, numGpusPerNode int) {
 	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
 	s3Bucket, _ := GetStorageBucketName()
 	if s3Endpoint == "" || s3Bucket == "" {
-		t.Skip("S3 not configured, skipping S3 checkpoint test")
+		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set all required S3 environment variables (AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_STORAGE_BUCKET)")
 	}
 
 	runRhaiFeaturesTestWithConfig(t, RhaiFeatureConfig{
@@ -424,7 +296,7 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 
 	// RBACs setup for user (user token is used by notebook for Trainer API calls)
 	userName := common.GetNotebookUserName(test)
-	userToken := common.GenerateNotebookUserToken(test)
+	userToken := common.GetNotebookUserToken(test)
 	CreateUserRoleBindingWithClusterRole(test, userName, namespace.Name, "admin")
 	// ClusterRoleBinding for cluster-scoped resources (ClusterTrainingRuntimes) - minimal get/list/watch access
 	trainerutils.CreateUserClusterRoleBindingForTrainerRuntimes(test, userName)
@@ -443,14 +315,14 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 		rhaiFeaturesNotebookName: nb,
 		"install_kubeflow.py":    installScript,
 	}
-	// Add cloud checkpoint management utility if using cloud storage (not PVC)
-	if isCloudStorageURI(config.CheckpointOutputDir) {
-		// Add cloud checkpoint management utility (handles both --prepare and --cleanup)
-		utilsScript, err := os.ReadFile(cloudCheckpointUtilsPath)
-		test.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("failed to read utils script: %s", cloudCheckpointUtilsPath))
-		cmData[cloudCheckpointUtilsName] = utilsScript
-	}
+	// Parse checkpoint URI scheme once and reuse throughout the function
+	checkpointScheme := parseURIScheme(config.CheckpointOutputDir)
 	cm := CreateConfigMap(test, namespace.Name, cmData)
+
+	// Prepare cloud checkpoint storage before creating notebook (best effort - won't fail test)
+	if checkpointScheme != "" {
+		trainerutils.PrepareCloudCheckpointStorage(test, config.CheckpointOutputDir)
+	}
 
 	// Create shared RWX PVC for distributed training (HF cache shared across nodes)
 	storageClass, err := GetRWXStorageClass(test)
@@ -512,11 +384,10 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 	// Automatically detects cloud storage from URI scheme (s3://, azure://, etc.)
 	// Reuse credentials already retrieved for s3Exports to avoid duplicate retrieval
 	var dataConnectionExports string
-	if isCloudStorageURI(config.CheckpointOutputDir) {
+	if checkpointScheme != "" {
 		// Build envVars from already-retrieved credentials to avoid duplicate retrieval
-		scheme := parseURIScheme(config.CheckpointOutputDir)
 		var envVars map[string]string
-		if scheme == "s3" && s3Endpoint != "" && s3AccessKey != "" && s3SecretKey != "" {
+		if checkpointScheme == "s3" && s3Endpoint != "" && s3AccessKey != "" && s3SecretKey != "" {
 			envVars = map[string]string{
 				"CHECKPOINT_OUTPUT_DIR": config.CheckpointOutputDir,
 				"AWS_DEFAULT_ENDPOINT":  s3Endpoint,
@@ -549,7 +420,6 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 	// Build pip exports - GPU_TYPE tells install_kubeflow.py which Red Hat index to use
 	pipExports := fmt.Sprintf("export GPU_TYPE='%s'; ", gpuType)
 	pipInstallFlags := ""
-	preRunCheckpointSetupCmd := buildPreRunCheckpointSetupCmd(config)
 
 	// Set defaults for num_nodes and num_gpus_per_node if not specified
 	numNodes := config.NumNodes
@@ -581,7 +451,6 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 			"%s"+ // Data Connection exports (if configured)
 			"%s"+ // PyPI/GPU_TYPE exports
 			"python -m pip install --quiet --no-cache-dir %s papermill ipykernel boto3==1.34.162 && "+
-			"%s"+ // Optional pre-run checkpoint storage setup (S3 cleanup for S3 tests)
 			"python /opt/app-root/notebooks/install_kubeflow.py && "+
 			"python -m ipykernel install --user --name=python3 && "+
 			"python -m papermill /opt/app-root/notebooks/%s /opt/app-root/src/out.ipynb --log-output; "+
@@ -600,7 +469,6 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 		dataConnectionExports,
 		pipExports,
 		pipInstallFlags,
-		preRunCheckpointSetupCmd,
 		rhaiFeaturesNotebookName,
 	)
 
@@ -613,9 +481,9 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 
 	// Cleanup - use longer timeout due to large runtime images
 	defer func() {
-		// Clean up cloud storage checkpoints if using cloud storage (check URI, not just flag)
-		if isCloudStorageURI(config.CheckpointOutputDir) {
-			cleanupCloudCheckpoints(test, namespace.Name, config.CheckpointOutputDir)
+		// Clean up cloud storage checkpoints if using cloud storage
+		if checkpointScheme != "" {
+			trainerutils.CleanupCloudCheckpointStorage(test, config.CheckpointOutputDir)
 		}
 		// Clean up Kubernetes resources
 		common.DeleteNotebook(test, namespace)

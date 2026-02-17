@@ -16,16 +16,31 @@ import sys
 
 
 def is_cloud_storage(uri: str) -> bool:
-    """Check if URI is cloud storage (contains protocol scheme)."""
-    return "://" in uri
+    """Check if URI is cloud storage (contains protocol scheme).
+    
+    Excludes PVC URIs (pvc://) and local filesystem paths (no scheme).
+    """
+    if "://" not in uri:
+        return False  # Local filesystem path (no scheme)
+    protocol, _ = uri.split("://", 1)
+    if protocol == "pvc":
+        return False  # PVC URIs are not cloud storage
+    return True  # All other schemes (s3, azure, gs, etc.) are cloud storage
 
 
 def parse_cloud_uri(uri: str) -> tuple[str, str, str]:
-    """Parse cloud URI into protocol, bucket, and prefix."""
+    """Parse cloud URI into protocol, bucket, and prefix.
+    
+    Excludes PVC URIs (pvc://) and local filesystem paths (no scheme).
+    """
     if "://" not in uri:
         return "", "", ""
 
     protocol, rest = uri.split("://", 1)
+    # Exclude PVC URIs - they are not cloud storage
+    if protocol == "pvc":
+        return "", "", ""
+
     parts = rest.split("/", 1)
     bucket = parts[0]
     prefix = parts[1] if len(parts) > 1 else ""
@@ -35,9 +50,9 @@ def parse_cloud_uri(uri: str) -> tuple[str, str, str]:
 
 def get_s3_client():
     """Create and return an S3 client using environment credentials."""
-    s3_endpoint = os.getenv("AWS_DEFAULT_ENDPOINT", "")
-    s3_access_key = os.getenv("AWS_ACCESS_KEY_ID", "")
-    s3_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    s3_endpoint = os.getenv("AWS_DEFAULT_ENDPOINT")
+    s3_access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    s3_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
 
     if not (s3_endpoint and s3_access_key and s3_secret_key):
         return None
