@@ -48,7 +48,8 @@ const (
 )
 
 // Compiled regex for epoch detection (compiled once for performance)
-var epochPattern = regexp.MustCompile(`'epoch': [2-9]`)
+// HuggingFace Trainer logs epochs as floats: 'epoch': 2.0, 'epoch': 3.0, etc.
+var epochPattern = regexp.MustCompile(`'epoch': [2-9](?:\.[0-9]+)?`)
 
 // boolStr converts bool to "true"/"false" string for env vars
 func boolStr(b bool) string {
