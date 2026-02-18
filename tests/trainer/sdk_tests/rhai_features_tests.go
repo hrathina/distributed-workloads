@@ -26,6 +26,7 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -249,7 +250,7 @@ func RunRhaiFeaturesAllMultiGpuTest(t *testing.T, accelerator Accelerator, numNo
 // RunRhaiS3CheckpointTest runs the e2e test for S3 checkpoint storage (requires S3 configuration)
 func RunRhaiS3CheckpointTest(t *testing.T, accelerator Accelerator) {
 	test := With(t)
-	
+
 	// Check if all S3 credentials are configured (same check as NewS3Provider)
 	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
 	s3AccessKey, _ := GetStorageBucketAccessKeyId()
@@ -281,7 +282,7 @@ func RunRhaiS3CheckpointTest(t *testing.T, accelerator Accelerator) {
 // RunRhaiS3CheckpointMultiGpuTest runs multi-GPU test for S3 checkpoint storage (requires S3 configuration)
 func RunRhaiS3CheckpointMultiGpuTest(t *testing.T, accelerator Accelerator, numNodes, numGpusPerNode int) {
 	test := With(t)
-	
+
 	// Check if all S3 credentials are configured (same check as NewS3Provider)
 	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
 	s3AccessKey, _ := GetStorageBucketAccessKeyId()
@@ -383,7 +384,7 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
 	s3AccessKey, _ := GetStorageBucketAccessKeyId()
 	s3SecretKey, _ := GetStorageBucketSecretKey()
-	
+
 	// Get bucket from env for models/datasets (separate from checkpoint bucket)
 	// For S3 checkpoint tests, checkpoint bucket is created dynamically and passed via CHECKPOINT_OUTPUT_DIR
 	modelsBucket, _ := GetStorageBucketName()
@@ -451,7 +452,7 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 					checkpointBucket = parts[0]
 				}
 			}
-			
+
 			envVars = map[string]string{
 				"CHECKPOINT_OUTPUT_DIR": config.CheckpointOutputDir,
 				"AWS_DEFAULT_ENDPOINT":  s3Endpoint,

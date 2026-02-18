@@ -397,7 +397,7 @@ func CleanupCloudCheckpointStorage(test Test, checkpointURI string) int {
 // Package-level variables to track dynamically created buckets
 var (
 	dynamicallyCreatedBuckets = make(map[string]bool)
-	bucketCreationMutex      sync.Mutex
+	bucketCreationMutex       sync.Mutex
 )
 
 // GetOrCreateS3Bucket returns a shared S3 bucket for all S3 checkpoint tests.
