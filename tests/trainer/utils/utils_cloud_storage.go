@@ -24,6 +24,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -74,6 +76,12 @@ type CloudStorageProvider interface {
 	PrepareStorage(ctx context.Context, uri *CloudURI) error
 	// CleanupStorage deletes all objects under the prefix
 	CleanupStorage(ctx context.Context, uri *CloudURI) (int, error)
+	// CreateBucket creates a new bucket if it doesn't exist
+	CreateBucket(ctx context.Context, bucketName string) error
+	// DeleteBucket deletes a bucket and all its contents
+	DeleteBucket(ctx context.Context, bucketName string) error
+	// BucketExists checks if a bucket exists
+	BucketExists(ctx context.Context, bucketName string) (bool, error)
 }
 
 // S3Provider implements CloudStorageProvider for S3-compatible storage
@@ -223,6 +231,99 @@ func (p *S3Provider) CleanupStorage(ctx context.Context, uri *CloudURI) (int, er
 	return deleted, nil
 }
 
+// CreateBucket creates a new S3 bucket if it doesn't exist
+func (p *S3Provider) CreateBucket(ctx context.Context, bucketName string) error {
+	if bucketName == "" {
+		return fmt.Errorf("bucket name cannot be empty")
+	}
+
+	client, err := p.getS3Client()
+	if err != nil {
+		return err
+	}
+
+	// Check if bucket already exists
+	exists, err := client.BucketExists(ctx, bucketName)
+	if err != nil {
+		return fmt.Errorf("failed to check if bucket exists: %w", err)
+	}
+
+	if exists {
+		return nil // Bucket already exists, no need to create
+	}
+
+	// Create the bucket
+	err = client.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create bucket %s: %w", bucketName, err)
+	}
+
+	return nil
+}
+
+// DeleteBucket deletes an S3 bucket and all its contents
+func (p *S3Provider) DeleteBucket(ctx context.Context, bucketName string) error {
+	if bucketName == "" {
+		return fmt.Errorf("bucket name cannot be empty")
+	}
+
+	client, err := p.getS3Client()
+	if err != nil {
+		return err
+	}
+
+	// Check if bucket exists
+	exists, err := client.BucketExists(ctx, bucketName)
+	if err != nil {
+		return fmt.Errorf("failed to check if bucket exists: %w", err)
+	}
+
+	if !exists {
+		return nil // Bucket doesn't exist, nothing to delete
+	}
+
+	// Delete all objects in the bucket first
+	objectsCh := client.ListObjects(ctx, bucketName, minio.ListObjectsOptions{
+		Recursive: true,
+	})
+
+	for object := range objectsCh {
+		if object.Err != nil {
+			return fmt.Errorf("failed to list objects: %w", object.Err)
+		}
+		if err := client.RemoveObject(ctx, bucketName, object.Key, minio.RemoveObjectOptions{}); err != nil {
+			return fmt.Errorf("failed to delete object %s: %w", object.Key, err)
+		}
+	}
+
+	// Delete the bucket
+	err = client.RemoveBucket(ctx, bucketName)
+	if err != nil {
+		return fmt.Errorf("failed to delete bucket %s: %w", bucketName, err)
+	}
+
+	return nil
+}
+
+// BucketExists checks if an S3 bucket exists
+func (p *S3Provider) BucketExists(ctx context.Context, bucketName string) (bool, error) {
+	if bucketName == "" {
+		return false, fmt.Errorf("bucket name cannot be empty")
+	}
+
+	client, err := p.getS3Client()
+	if err != nil {
+		return false, err
+	}
+
+	exists, err := client.BucketExists(ctx, bucketName)
+	if err != nil {
+		return false, fmt.Errorf("failed to check if bucket exists: %w", err)
+	}
+
+	return exists, nil
+}
+
 // getCloudStorageProvider returns the appropriate provider for the given URI scheme.
 // Easy to extend: add cases for "azure", "gs" (GCS), etc.
 func getCloudStorageProvider(scheme string) (CloudStorageProvider, error) {
@@ -291,4 +392,105 @@ func CleanupCloudCheckpointStorage(test Test, checkpointURI string) int {
 
 	test.T().Logf("Cloud checkpoint cleanup: deleted %d objects from %s://%s/%s", deleted, uri.Scheme, uri.Bucket, uri.Prefix)
 	return deleted
+}
+
+// Package-level variables to track dynamically created buckets
+var (
+	dynamicallyCreatedBuckets = make(map[string]bool)
+	bucketCreationMutex      sync.Mutex
+)
+
+// GetOrCreateS3Bucket returns a shared S3 bucket for all S3 checkpoint tests.
+// The first call creates a new bucket and stores it in sharedS3BucketName.
+// Subsequent calls reuse the same bucket across all test namespaces.
+// The bucket is cleaned up after all tests complete via TestMain cleanup.
+var sharedS3BucketName string
+
+func GetOrCreateS3Bucket(test Test) (string, error) {
+	test.T().Helper()
+
+	bucketCreationMutex.Lock()
+	defer bucketCreationMutex.Unlock()
+
+	// Reuse the same bucket if it already exists
+	if sharedS3BucketName != "" {
+		// Verify the bucket still exists
+		provider, err := NewS3Provider()
+		if err == nil {
+			ctx := test.Ctx()
+			exists, err := provider.BucketExists(ctx, sharedS3BucketName)
+			if err == nil && exists {
+				test.T().Logf("Reusing existing shared S3 bucket: %s", sharedS3BucketName)
+				return sharedS3BucketName, nil
+			}
+		}
+	}
+
+	// Create a new shared bucket for all S3 tests
+	timestamp := time.Now().Unix()
+	bucketName := fmt.Sprintf("test-checkpoints-%d", timestamp)
+
+	// Create S3 provider
+	provider, err := NewS3Provider()
+	if err != nil {
+		return "", fmt.Errorf("failed to create S3 provider: %w", err)
+	}
+
+	// Create the bucket
+	ctx := test.Ctx()
+	if err := provider.CreateBucket(ctx, bucketName); err != nil {
+		return "", fmt.Errorf("failed to create bucket %s: %w", bucketName, err)
+	}
+
+	// Track this bucket for cleanup and store as shared bucket
+	dynamicallyCreatedBuckets[bucketName] = true
+	sharedS3BucketName = bucketName
+	test.T().Logf("Created shared S3 bucket for all S3 tests: %s (will be cleaned up after all tests)", bucketName)
+
+	return bucketName, nil
+}
+
+// isS3Configured checks if all required S3 credentials are configured
+func isS3Configured() bool {
+	endpoint, _ := GetStorageBucketDefaultEndpoint()
+	accessKey, _ := GetStorageBucketAccessKeyId()
+	secretKey, _ := GetStorageBucketSecretKey()
+	return endpoint != "" && accessKey != "" && secretKey != ""
+}
+
+// CleanupDynamicallyCreatedBuckets deletes all buckets that were created dynamically during tests.
+// This should be called after all S3 tests complete.
+// Only attempts cleanup if S3 credentials are fully configured (endpoint, accessKey, secretKey).
+// This function can be called from TestMain where a Test interface may not be available.
+func CleanupDynamicallyCreatedBuckets() {
+	bucketCreationMutex.Lock()
+	defer bucketCreationMutex.Unlock()
+
+	if len(dynamicallyCreatedBuckets) == 0 {
+		return
+	}
+
+	// Only cleanup if S3 credentials are fully configured
+	// If credentials aren't configured, tests wouldn't have run anyway, so no buckets to clean
+	if !isS3Configured() {
+		fmt.Printf("S3 credentials not configured, skipping bucket cleanup\n")
+		return
+	}
+
+	provider, err := NewS3Provider()
+	if err != nil {
+		fmt.Printf("Failed to create S3 provider for bucket cleanup: %v\n", err)
+		return
+	}
+
+	ctx := context.Background()
+	for bucketName := range dynamicallyCreatedBuckets {
+		fmt.Printf("Cleaning up dynamically created bucket: %s\n", bucketName)
+		if err := provider.DeleteBucket(ctx, bucketName); err != nil {
+			fmt.Printf("Warning: failed to delete bucket %s: %v\n", bucketName, err)
+		} else {
+			fmt.Printf("Successfully deleted bucket: %s\n", bucketName)
+		}
+		delete(dynamicallyCreatedBuckets, bucketName)
+	}
 }

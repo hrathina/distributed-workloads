@@ -128,8 +128,11 @@ func createCloudStorageDataConnection(test Test, namespace string, checkpointURI
 			"AWS_S3_ENDPOINT":       envVars["AWS_DEFAULT_ENDPOINT"],
 		}
 		// Add all optional fields that are available (use whatever is provided in envVars)
-		// Map AWS_STORAGE_BUCKET from s3Exports to AWS_S3_BUCKET (SDK expects AWS_S3_BUCKET)
-		if bucket, ok := envVars["AWS_STORAGE_BUCKET"]; ok && bucket != "" {
+		// Check for AWS_S3_BUCKET directly (for checkpoint bucket) or AWS_STORAGE_BUCKET (for models bucket)
+		// SDK expects AWS_S3_BUCKET in the secret
+		if bucket, ok := envVars["AWS_S3_BUCKET"]; ok && bucket != "" {
+			secretData["AWS_S3_BUCKET"] = bucket
+		} else if bucket, ok := envVars["AWS_STORAGE_BUCKET"]; ok && bucket != "" {
 			secretData["AWS_S3_BUCKET"] = bucket
 		}
 	// Future: add cases for other cloud providers (Azure, GCS, etc.)
@@ -246,11 +249,23 @@ func RunRhaiFeaturesAllMultiGpuTest(t *testing.T, accelerator Accelerator, numNo
 
 // RunRhaiS3CheckpointTest runs the e2e test for S3 checkpoint storage (requires S3 configuration)
 func RunRhaiS3CheckpointTest(t *testing.T, accelerator Accelerator) {
+	test := With(t)
+	
+	// Check if all S3 credentials are configured (same check as NewS3Provider)
 	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
-	s3Bucket, _ := GetStorageBucketName()
-	if s3Endpoint == "" || s3Bucket == "" {
-		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set all required S3 environment variables (AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_STORAGE_BUCKET)")
+	s3AccessKey, _ := GetStorageBucketAccessKeyId()
+	s3SecretKey, _ := GetStorageBucketSecretKey()
+	if s3Endpoint == "" || s3AccessKey == "" || s3SecretKey == "" {
+		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY")
 	}
+
+	// Get or create shared S3 bucket for all S3 checkpoint tests
+	// The same bucket is reused across all S3 tests to avoid creating multiple buckets
+	s3Bucket, err := trainerutils.GetOrCreateS3Bucket(test)
+	if err != nil {
+		t.Fatalf("Failed to create S3 bucket: %v", err)
+	}
+	t.Logf("Using shared S3 bucket: %s (will be cleaned up after all tests)", s3Bucket)
 
 	runRhaiFeaturesTestWithConfig(t, RhaiFeatureConfig{
 		EnableProgressionTracking: false,
@@ -266,11 +281,23 @@ func RunRhaiS3CheckpointTest(t *testing.T, accelerator Accelerator) {
 
 // RunRhaiS3CheckpointMultiGpuTest runs multi-GPU test for S3 checkpoint storage (requires S3 configuration)
 func RunRhaiS3CheckpointMultiGpuTest(t *testing.T, accelerator Accelerator, numNodes, numGpusPerNode int) {
+	test := With(t)
+	
+	// Check if all S3 credentials are configured (same check as NewS3Provider)
 	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
-	s3Bucket, _ := GetStorageBucketName()
-	if s3Endpoint == "" || s3Bucket == "" {
-		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set all required S3 environment variables (AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_STORAGE_BUCKET)")
+	s3AccessKey, _ := GetStorageBucketAccessKeyId()
+	s3SecretKey, _ := GetStorageBucketSecretKey()
+	if s3Endpoint == "" || s3AccessKey == "" || s3SecretKey == "" {
+		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY")
 	}
+
+	// Get or create shared S3 bucket for all S3 checkpoint tests
+	// The same bucket is reused across all S3 tests to avoid creating multiple buckets
+	s3Bucket, err := trainerutils.GetOrCreateS3Bucket(test)
+	if err != nil {
+		t.Fatalf("Failed to create S3 bucket: %v", err)
+	}
+	t.Logf("Using shared S3 bucket: %s (will be cleaned up after all tests)", s3Bucket)
 
 	runRhaiFeaturesTestWithConfig(t, RhaiFeatureConfig{
 		EnableProgressionTracking: false,
@@ -351,10 +378,16 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 	}
 
 	// S3/MinIO configuration for disconnected environments (optional)
+	// Note: For S3 checkpoint tests, we create a separate bucket for checkpoints.
+	// Models/datasets should come from HuggingFace (connected) or from AWS_STORAGE_BUCKET if set (disconnected).
+	// We don't use the checkpoint bucket for models/datasets to avoid confusion.
 	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
 	s3AccessKey, _ := GetStorageBucketAccessKeyId()
 	s3SecretKey, _ := GetStorageBucketSecretKey()
-	s3Bucket, _ := GetStorageBucketName()
+	
+	// Get bucket from env for models/datasets (separate from checkpoint bucket)
+	// For S3 checkpoint tests, checkpoint bucket is created dynamically and passed via CHECKPOINT_OUTPUT_DIR
+	modelsBucket, _ := GetStorageBucketName()
 	modelS3Prefix := os.Getenv("MODEL_S3_PREFIX")
 	if modelS3Prefix == "" {
 		modelS3Prefix = "models/distilgpt2"
@@ -364,40 +397,72 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 		datasetS3Prefix = "alpaca-cleaned-datasets"
 	}
 
-	// Build S3 export commands (only if configured)
+	// Build S3 export commands for models/datasets (only if configured and bucket exists)
+	// This is separate from checkpoint storage which uses its own bucket
+	// Verify bucket exists before setting AWS_STORAGE_BUCKET to ensure notebook can access it
 	s3Exports := ""
-	if s3Endpoint != "" && s3Bucket != "" {
-		test.T().Logf("S3 mode: endpoint=%s, bucket=%s", s3Endpoint, s3Bucket)
-		s3Exports = fmt.Sprintf(
-			"export AWS_DEFAULT_ENDPOINT='%s'; "+
-				"export AWS_ACCESS_KEY_ID='%s'; "+
-				"export AWS_SECRET_ACCESS_KEY='%s'; "+
-				"export AWS_STORAGE_BUCKET='%s'; "+
-				"export MODEL_S3_PREFIX='%s'; "+
-				"export DATASET_S3_PREFIX='%s'; ",
-			s3Endpoint, s3AccessKey, s3SecretKey, s3Bucket, modelS3Prefix, datasetS3Prefix,
-		)
-	} else {
-		test.T().Log("HuggingFace mode: S3 not configured, will download from HF Hub")
+	if s3Endpoint != "" && modelsBucket != "" {
+		// Verify bucket exists before using it
+		provider, err := trainerutils.NewS3Provider()
+		if err == nil {
+			ctx := test.Ctx()
+			exists, err := provider.BucketExists(ctx, modelsBucket)
+			if err != nil {
+				test.T().Logf("Warning: Failed to verify bucket existence for %s: %v. Skipping S3 mode for models/datasets.", modelsBucket, err)
+			} else if !exists {
+				test.T().Logf("Warning: Bucket %s does not exist. Skipping S3 mode for models/datasets. Will use HuggingFace.", modelsBucket)
+			} else {
+				test.T().Logf("S3 mode for models/datasets: endpoint=%s, bucket=%s", s3Endpoint, modelsBucket)
+				s3Exports = fmt.Sprintf(
+					"export AWS_DEFAULT_ENDPOINT='%s'; "+
+						"export AWS_ACCESS_KEY_ID='%s'; "+
+						"export AWS_SECRET_ACCESS_KEY='%s'; "+
+						"export AWS_STORAGE_BUCKET='%s'; "+
+						"export MODEL_S3_PREFIX='%s'; "+
+						"export DATASET_S3_PREFIX='%s'; ",
+					s3Endpoint, s3AccessKey, s3SecretKey, modelsBucket, modelS3Prefix, datasetS3Prefix,
+				)
+			}
+		} else {
+			test.T().Logf("Warning: Failed to create S3 provider to verify bucket: %v. Skipping S3 mode for models/datasets.", err)
+		}
+	}
+	if s3Exports == "" {
+		test.T().Log("HuggingFace mode: S3 not configured for models/datasets, will download from HF Hub")
 	}
 
 	// Create Data Connection secret for cloud checkpointing (if configured)
 	// Automatically detects cloud storage from URI scheme (s3://, azure://, etc.)
-	// Reuse credentials already retrieved for s3Exports to avoid duplicate retrieval
+	// Note: Data Connection is ONLY for checkpoints. The checkpoint bucket is extracted from CHECKPOINT_OUTPUT_DIR.
+	// AWS_STORAGE_BUCKET (for models/datasets) is separate and handled in s3Exports above.
 	var dataConnectionExports string
 	if checkpointScheme != "" {
-		// Build envVars from already-retrieved credentials to avoid duplicate retrieval
+		// Build envVars for checkpoint storage only
+		// Extract bucket name from checkpoint URI (e.g., s3://bucket/checkpoints -> bucket)
+		// This bucket is used in the Data Connection secret as AWS_S3_BUCKET
 		var envVars map[string]string
 		if checkpointScheme == "s3" && s3Endpoint != "" && s3AccessKey != "" && s3SecretKey != "" {
+			// Parse checkpoint URI to extract bucket name for Data Connection
+			// Format: s3://bucket/checkpoints -> extract "bucket"
+			checkpointBucket := ""
+			if strings.HasPrefix(config.CheckpointOutputDir, "s3://") {
+				rest := strings.TrimPrefix(config.CheckpointOutputDir, "s3://")
+				parts := strings.SplitN(rest, "/", 2)
+				if len(parts) > 0 {
+					checkpointBucket = parts[0]
+				}
+			}
+			
 			envVars = map[string]string{
 				"CHECKPOINT_OUTPUT_DIR": config.CheckpointOutputDir,
 				"AWS_DEFAULT_ENDPOINT":  s3Endpoint,
 				"AWS_ACCESS_KEY_ID":     s3AccessKey,
 				"AWS_SECRET_ACCESS_KEY": s3SecretKey,
 			}
-			// Add all S3 credentials that are exported in s3Exports
-			if s3Bucket != "" {
-				envVars["AWS_STORAGE_BUCKET"] = s3Bucket
+			// Add checkpoint bucket for Data Connection (mapped to AWS_S3_BUCKET in createCloudStorageDataConnection)
+			// This is ONLY for the Data Connection secret, NOT exposed to notebook as AWS_STORAGE_BUCKET
+			if checkpointBucket != "" {
+				envVars["AWS_S3_BUCKET"] = checkpointBucket
 			}
 		}
 		dataConnectionExports = createCloudStorageDataConnection(test, namespace.Name, config.CheckpointOutputDir, envVars)
@@ -935,7 +1000,7 @@ func suspendTrainJob(test Test, namespace, trainJobName string, suspend bool) {
 	test.T().Helper()
 
 	// Use JSON merge patch to only modify spec.suspend field
-	// This avoids webhook validation errors about modifying podTemplateOverrides
+	// This ensures only the suspend field is updated without affecting other spec fields
 	patchData := fmt.Sprintf(`{"spec":{"suspend":%t}}`, suspend)
 
 	_, err := test.Client().Trainer().TrainerV1alpha1().TrainJobs(namespace).Patch(
