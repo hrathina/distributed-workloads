@@ -59,7 +59,6 @@ func boolStr(b bool) string {
 	return "false"
 }
 
-
 // RhaiFeatureConfig holds configuration for RHAI feature tests
 type RhaiFeatureConfig struct {
 	EnableProgressionTracking bool
@@ -755,7 +754,7 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 				"This usually means the SDK's checkpoint config override (save_strategy, output_dir) "+
 				"was not applied to the Trainer. Check full training pod logs for '[Kubeflow]' messages.")
 		test.T().Log("Cloud checkpoint upload verified in logs - verifying checkpoints exist in S3...")
-		
+
 		// Verify checkpoints actually exist in S3 (not just logs)
 		test.Eventually(func() bool {
 			return trainerutils.CheckpointExistsInS3(test, checkpointDir)
