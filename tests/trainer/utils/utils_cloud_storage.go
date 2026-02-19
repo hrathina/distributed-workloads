@@ -40,10 +40,10 @@ type CloudURI struct {
 	Prefix string
 }
 
-// parseCloudURI parses a cloud storage URI into scheme, bucket, and prefix.
+// ParseCloudURI parses a cloud storage URI into scheme, bucket, and prefix.
 // Excludes PVC URIs (pvc://) and local filesystem paths (no scheme).
 // Returns nil if not a valid cloud storage URI.
-func parseCloudURI(uri string) *CloudURI {
+func ParseCloudURI(uri string) *CloudURI {
 	if idx := strings.Index(uri, "://"); idx <= 0 {
 		return nil // Local filesystem path (no scheme)
 	}
@@ -112,8 +112,8 @@ func NewS3Provider() (*S3Provider, error) {
 	}, nil
 }
 
-// getS3Client creates an S3 client with the provider's credentials
-func (p *S3Provider) getS3Client() (*minio.Client, error) {
+// GetS3Client creates an S3 client with the provider's credentials
+func (p *S3Provider) GetS3Client() (*minio.Client, error) {
 	endpointURL := p.endpoint
 	secure := true
 	if !strings.HasPrefix(endpointURL, "http") {
@@ -125,15 +125,11 @@ func (p *S3Provider) getS3Client() (*minio.Client, error) {
 	// Extract host:port from URL (remove http:// or https://)
 	endpoint := strings.TrimPrefix(strings.TrimPrefix(endpointURL, "https://"), "http://")
 
-	// Configure TLS verification based on environment variables
-	// CHECKPOINT_VERIFY_SSL or VERIFY_SSL can be set to "true" to enable certificate verification
+	// Configure TLS verification based on environment variable
+	// CHECKPOINT_VERIFY_SSL can be set to "true" to enable certificate verification
 	// Defaults to false to support test environments with self-signed certificates
 	verifySSL := false
 	if verifySSLEnv := os.Getenv("CHECKPOINT_VERIFY_SSL"); verifySSLEnv != "" {
-		if val, err := strconv.ParseBool(verifySSLEnv); err == nil {
-			verifySSL = val
-		}
-	} else if verifySSLEnv := os.Getenv("VERIFY_SSL"); verifySSLEnv != "" {
 		if val, err := strconv.ParseBool(verifySSLEnv); err == nil {
 			verifySSL = val
 		}
@@ -167,7 +163,7 @@ func (p *S3Provider) PrepareStorage(ctx context.Context, uri *CloudURI) error {
 		return fmt.Errorf("invalid URI: bucket and prefix required")
 	}
 
-	client, err := p.getS3Client()
+	client, err := p.GetS3Client()
 	if err != nil {
 		return err
 	}
@@ -206,7 +202,7 @@ func (p *S3Provider) CleanupStorage(ctx context.Context, uri *CloudURI) (int, er
 		return 0, fmt.Errorf("invalid URI: bucket and prefix required")
 	}
 
-	client, err := p.getS3Client()
+	client, err := p.GetS3Client()
 	if err != nil {
 		return 0, err
 	}
@@ -237,7 +233,7 @@ func (p *S3Provider) CreateBucket(ctx context.Context, bucketName string) error 
 		return fmt.Errorf("bucket name cannot be empty")
 	}
 
-	client, err := p.getS3Client()
+	client, err := p.GetS3Client()
 	if err != nil {
 		return err
 	}
@@ -267,7 +263,7 @@ func (p *S3Provider) DeleteBucket(ctx context.Context, bucketName string) error 
 		return fmt.Errorf("bucket name cannot be empty")
 	}
 
-	client, err := p.getS3Client()
+	client, err := p.GetS3Client()
 	if err != nil {
 		return err
 	}
@@ -311,7 +307,7 @@ func (p *S3Provider) BucketExists(ctx context.Context, bucketName string) (bool,
 		return false, fmt.Errorf("bucket name cannot be empty")
 	}
 
-	client, err := p.getS3Client()
+	client, err := p.GetS3Client()
 	if err != nil {
 		return false, err
 	}
@@ -343,7 +339,7 @@ func getCloudStorageProvider(scheme string) (CloudStorageProvider, error) {
 func PrepareCloudCheckpointStorage(test Test, checkpointURI string) error {
 	test.T().Helper()
 
-	uri := parseCloudURI(checkpointURI)
+	uri := ParseCloudURI(checkpointURI)
 	if uri == nil {
 		return nil // Not a cloud storage URI, skip
 	}
@@ -371,7 +367,7 @@ func PrepareCloudCheckpointStorage(test Test, checkpointURI string) error {
 func CleanupCloudCheckpointStorage(test Test, checkpointURI string) int {
 	test.T().Helper()
 
-	uri := parseCloudURI(checkpointURI)
+	uri := ParseCloudURI(checkpointURI)
 	if uri == nil {
 		test.T().Logf("Cloud checkpoint cleanup: skip (not cloud storage)")
 		return 0
@@ -456,6 +452,50 @@ func isS3Configured() bool {
 	accessKey, _ := GetStorageBucketAccessKeyId()
 	secretKey, _ := GetStorageBucketSecretKey()
 	return endpoint != "" && accessKey != "" && secretKey != ""
+}
+
+// CheckpointExistsInS3 verifies that at least one checkpoint object exists in S3 storage.
+// Returns true if checkpoints are found, false otherwise. Errors are logged but do not cause failures.
+func CheckpointExistsInS3(test Test, checkpointURI string) bool {
+	test.T().Helper()
+
+	uri := ParseCloudURI(checkpointURI)
+	if uri == nil || uri.Scheme != "s3" {
+		return false // Not an S3 URI
+	}
+
+	provider, err := NewS3Provider()
+	if err != nil {
+		test.T().Logf("Failed to create S3 provider to verify checkpoints: %v", err)
+		return false
+	}
+
+	client, err := provider.GetS3Client()
+	if err != nil {
+		test.T().Logf("Failed to create S3 client to verify checkpoints: %v", err)
+		return false
+	}
+
+	// List objects under the checkpoint prefix (exclude .keep file)
+	fullPrefix := strings.TrimSuffix(uri.Prefix, "/") + "/"
+	objectsCh := client.ListObjects(test.Ctx(), uri.Bucket, minio.ListObjectsOptions{
+		Prefix:    fullPrefix,
+		Recursive: true,
+	})
+
+	objectCount := 0
+	for object := range objectsCh {
+		if object.Err != nil {
+			test.T().Logf("Error listing objects in S3: %v", object.Err)
+			return false
+		}
+		// Skip .keep file and .incomplete markers
+		if !strings.HasSuffix(object.Key, "/.keep") && !strings.Contains(object.Key, ".incomplete") {
+			objectCount++
+		}
+	}
+
+	return objectCount > 0
 }
 
 // CleanupDynamicallyCreatedBuckets deletes all buckets that were created dynamically during tests.
