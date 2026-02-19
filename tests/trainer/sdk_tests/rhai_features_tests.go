@@ -340,20 +340,13 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 	// AWS_STORAGE_BUCKET (for models/datasets) is separate and handled in s3Exports above.
 	var dataConnectionExports string
 	checkpointURI := trainerutils.ParseCloudURI(config.CheckpointOutputDir)
-	if checkpointURI != nil && checkpointURI.Scheme == "s3" && s3Endpoint != "" && s3AccessKey != "" && s3SecretKey != "" {
-		// Extract bucket name from checkpoint URI (e.g., s3://bucket/checkpoints -> bucket)
-		// This bucket is used in the Data Connection secret as AWS_S3_BUCKET
-		checkpointBucket := checkpointURI.Bucket
-
+	if checkpointURI != nil && checkpointURI.Scheme == "s3" && checkpointURI.Bucket != "" && s3Endpoint != "" && s3AccessKey != "" && s3SecretKey != "" {
 		// Create Data Connection secret for S3 checkpoint storage
 		secretData := map[string]string{
 			"AWS_ACCESS_KEY_ID":     s3AccessKey,
 			"AWS_SECRET_ACCESS_KEY": s3SecretKey,
 			"AWS_S3_ENDPOINT":       s3Endpoint,
-		}
-		// SDK expects AWS_S3_BUCKET in the secret
-		if checkpointBucket != "" {
-			secretData["AWS_S3_BUCKET"] = checkpointBucket
+			"AWS_S3_BUCKET":         checkpointURI.Bucket,
 		}
 
 		secret := CreateSecret(test, namespace.Name, secretData)
@@ -725,7 +718,7 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 	// This catches SDK monkey-patch failures early - if save_strategy override didn't apply,
 	// no checkpoints are saved and no uploads happen
 	checkpointURI := trainerutils.ParseCloudURI(checkpointDir)
-	if checkpointURI != nil && checkpointURI.Scheme == "s3" {
+	if checkpointURI != nil && checkpointURI.Scheme == "s3" && checkpointURI.Bucket != "" {
 		test.T().Log("Step 1b: Verifying cloud checkpoint upload is working...")
 		test.Eventually(func() bool {
 			for _, pod := range listTrainingPods(test, namespace, trainJobName) {
@@ -775,10 +768,13 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 
 	// Step 4: Verify job is suspended and not already completed
 	// This ensures the suspend operation took effect before training finished
-	test.T().Log("Step 4: Verifying job is suspended (not completed)...")
+	test.T().Log("Step 4: Verifying job is suspended (not completed or failed)...")
 	trainJob := TrainJob(test, namespace, trainJobName)(test)
 	if TrainJobConditionComplete(trainJob) == metav1.ConditionTrue {
 		test.T().Fatal("Training completed before suspend took effect - cannot verify JIT checkpoint functionality. Consider increasing dataset size or epochs.")
+	}
+	if TrainJobConditionFailed(trainJob) == metav1.ConditionTrue {
+		test.T().Fatal("Training failed before suspend took effect - cannot verify JIT checkpoint functionality.")
 	}
 	test.Expect(TrainJobConditionSuspended(trainJob)).To(Equal(metav1.ConditionTrue), "TrainJob should be in suspended state")
 	test.T().Log("TrainJob is suspended")
