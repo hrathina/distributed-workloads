@@ -146,3 +146,55 @@ func TestRhaiS3CheckpointingMultiGpuRocm(t *testing.T) {
 	Tags(t, KftoRocm, MultiNodeMultiGpu(2, support.AMD, 2))
 	sdktests.RunRhaiS3CheckpointMultiGpuTest(t, support.AMD, 2, 2)
 }
+
+// FSDP S3 Checkpoint tests (using FSDP full state notebook)
+func TestRhaiS3CheckpointingFSDPCPU(t *testing.T) {
+	Tags(t, Tier1)
+	sdktests.RunRhaiS3CheckpointFSDPTest(t, support.CPU)
+}
+
+func TestRhaiS3CheckpointingFSDPCuda(t *testing.T) {
+	Tags(t, KftoCuda, MultiNodeGpu(2, support.NVIDIA))
+	sdktests.RunRhaiS3CheckpointFSDPTest(t, support.NVIDIA)
+}
+
+func TestRhaiS3CheckpointingFSDPRocm(t *testing.T) {
+	Tags(t, KftoRocm, MultiNodeGpu(2, support.AMD))
+	sdktests.RunRhaiS3CheckpointFSDPTest(t, support.AMD)
+}
+
+func TestRhaiS3CheckpointingFSDPMultiGpuCuda(t *testing.T) {
+	Tags(t, KftoCuda, MultiNodeMultiGpu(2, support.NVIDIA, 2))
+	sdktests.RunRhaiS3CheckpointFSDPMultiGpuTest(t, support.NVIDIA, 2, 2)
+}
+
+func TestRhaiS3CheckpointingFSDPMultiGpuRocm(t *testing.T) {
+	Tags(t, KftoRocm, MultiNodeMultiGpu(2, support.AMD, 2))
+	sdktests.RunRhaiS3CheckpointFSDPMultiGpuTest(t, support.AMD, 2, 2)
+}
+
+// FSDP Shared State S3 Checkpoint tests (using FSDP shared state notebook)
+func TestRhaiS3CheckpointingFSDPSharedStateCPU(t *testing.T) {
+	Tags(t, Tier1)
+	sdktests.RunRhaiS3CheckpointFSDPSharedStateTest(t, support.CPU)
+}
+
+func TestRhaiS3CheckpointingFSDPSharedStateCuda(t *testing.T) {
+	Tags(t, KftoCuda, MultiNodeGpu(2, support.NVIDIA))
+	sdktests.RunRhaiS3CheckpointFSDPSharedStateTest(t, support.NVIDIA)
+}
+
+func TestRhaiS3CheckpointingFSDPSharedStateRocm(t *testing.T) {
+	Tags(t, KftoRocm, MultiNodeGpu(2, support.AMD))
+	sdktests.RunRhaiS3CheckpointFSDPSharedStateTest(t, support.AMD)
+}
+
+func TestRhaiS3CheckpointingFSDPSharedStateMultiGpuCuda(t *testing.T) {
+	Tags(t, KftoCuda, MultiNodeMultiGpu(2, support.NVIDIA, 2))
+	sdktests.RunRhaiS3CheckpointFSDPSharedStateMultiGpuTest(t, support.NVIDIA, 2, 2)
+}
+
+func TestRhaiS3CheckpointingFSDPSharedStateMultiGpuRocm(t *testing.T) {
+	Tags(t, KftoRocm, MultiNodeMultiGpu(2, support.AMD, 2))
+	sdktests.RunRhaiS3CheckpointFSDPSharedStateMultiGpuTest(t, support.AMD, 2, 2)
+}
