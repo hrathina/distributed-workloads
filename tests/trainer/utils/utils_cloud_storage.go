@@ -494,3 +494,91 @@ func CleanupDynamicallyCreatedBuckets() {
 		delete(dynamicallyCreatedBuckets, bucketName)
 	}
 }
+
+// CheckpointType represents the type of FSDP checkpoint
+type CheckpointType string
+
+const (
+	CheckpointTypeFullState   CheckpointType = "FULL_STATE_DICT"
+	CheckpointTypeSharedState CheckpointType = "SHARDED_STATE_DICT"
+	CheckpointTypeUnknown     CheckpointType = "UNKNOWN"
+)
+
+// VerifyCheckpointType verifies whether checkpoints in S3 are full state or shared state
+// by analyzing the file structure. Returns the detected checkpoint type.
+func VerifyCheckpointType(test Test, checkpointURI string) CheckpointType {
+	test.T().Helper()
+
+	uri := parseCloudURI(checkpointURI)
+	if uri == nil {
+		test.T().Log("Not a cloud storage URI, cannot verify checkpoint type")
+		return CheckpointTypeUnknown
+	}
+
+	provider, err := getCloudStorageProvider(uri.Scheme)
+	if err != nil {
+		test.T().Logf("Failed to get cloud storage provider: %v", err)
+		return CheckpointTypeUnknown
+	}
+
+	s3Provider, ok := provider.(*S3Provider)
+	if !ok {
+		test.T().Log("Only S3 checkpoints are supported for verification")
+		return CheckpointTypeUnknown
+	}
+
+	client, err := s3Provider.getS3Client()
+	if err != nil {
+		test.T().Logf("Failed to create S3 client: %v", err)
+		return CheckpointTypeUnknown
+	}
+
+	// List all checkpoint files
+	fullPrefix := strings.TrimSuffix(uri.Prefix, "/") + "/"
+	objectsCh := client.ListObjects(test.Ctx(), uri.Bucket, minio.ListObjectsOptions{
+		Prefix:    fullPrefix,
+		Recursive: true,
+	})
+
+	var files []string
+	for object := range objectsCh {
+		if object.Err != nil {
+			test.T().Logf("Error listing objects: %v", object.Err)
+			continue
+		}
+		// Extract filename from full path
+		filename := strings.TrimPrefix(object.Key, fullPrefix)
+		if filename != "" && filename != ".keep" {
+			files = append(files, filename)
+		}
+	}
+
+	if len(files) == 0 {
+		test.T().Log("No checkpoint files found")
+		return CheckpointTypeUnknown
+	}
+
+	test.T().Logf("Found %d checkpoint files", len(files))
+
+	// Check for FSDP sharded state indicators:
+	// - Multiple rank-specific files (e.g., __0_0.distcp, __1_0.distcp)
+	// - Metadata files (.metadata)
+	hasShardedMetadata := false
+	for _, file := range files {
+		// SHARDED_STATE_DICT creates .distcp files or numbered model shards
+		if strings.Contains(file, ".distcp") || strings.Contains(file, "__") {
+			hasShardedMetadata = true
+			test.T().Logf("Found sharded state indicator: %s", file)
+			break
+		}
+	}
+
+	if hasShardedMetadata {
+		test.T().Log("Checkpoint type: SHARDED_STATE_DICT (shared state)")
+		return CheckpointTypeSharedState
+	}
+
+	// FULL_STATE_DICT creates unified checkpoint files without sharding metadata
+	test.T().Log("Checkpoint type: FULL_STATE_DICT (full state)")
+	return CheckpointTypeFullState
+}

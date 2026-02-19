@@ -1098,6 +1098,13 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 	test.T().Log("Step 9: Verifying checkpoint was loaded from logs...")
 	verifyCheckpointLoadedFromLogs(test, namespace, trainJobName, checkpointDir)
 
+	// Step 10: Verify checkpoint type (only for S3 checkpoints)
+	if strings.Contains(checkpointDir, "://") {
+		test.T().Log("Step 10: Verifying checkpoint type...")
+		checkpointType := trainerutils.VerifyCheckpointType(test, checkpointDir)
+		test.T().Logf("Detected checkpoint type: %s", checkpointType)
+	}
+
 	test.T().Log("JIT checkpoint verification completed successfully!")
 }
 
