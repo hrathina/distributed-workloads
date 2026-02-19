@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,10 +47,6 @@ const (
 	annotationMetricsPollInterval = "trainer.opendatahub.io/metrics-poll-interval"
 	annotationTrainerStatus       = "trainer.opendatahub.io/trainerStatus"
 )
-
-// Compiled regex for epoch detection (compiled once for performance)
-// HuggingFace Trainer logs epochs as floats: 'epoch': 2.0, 'epoch': 3.0, etc.
-var epochPattern = regexp.MustCompile(`'epoch': [2-9](?:\.[0-9]+)?`)
 
 // boolStr converts bool to "true"/"false" string for env vars
 func boolStr(b bool) string {
@@ -720,7 +717,7 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 	// JIT checkpoint gets .incomplete marker (epoch 1 checkpoint is fully saved/uploaded).
 	test.T().Log("Waiting for training to complete at least 2 epochs (checking logs)...")
 	test.Eventually(func() bool {
-		return hasCompletedEpochFromLogs(test, namespace, trainJobName, epochPattern, 2)
+		return hasCompletedEpochFromLogs(test, namespace, trainJobName, 2)
 	}, TestTimeoutMedium, 5*time.Second).Should(BeTrue(), "Training should complete at least 2 epochs before suspension")
 	test.T().Log("At least 2 epochs completed - ready to suspend")
 
@@ -968,16 +965,26 @@ func listTrainingPods(test Test, namespace, trainJobName string) []corev1.Pod {
 }
 
 // hasCompletedEpochFromLogs checks if training has completed the required number of epochs by examining pod logs
-// HuggingFace Trainer logs: {'loss': X, ..., 'epoch': 1.0} - pattern matches the target epoch
-func hasCompletedEpochFromLogs(test Test, namespace, trainJobName string, pattern *regexp.Regexp, minEpoch int) bool {
+// HuggingFace Trainer logs: {'loss': X, ..., 'epoch': 1.0} - matches epochs >= minEpoch
+func hasCompletedEpochFromLogs(test Test, namespace, trainJobName string, minEpoch int) bool {
+	// Match epoch values in HuggingFace Trainer log format: 'epoch': N or 'epoch': N.M
+	pattern := regexp.MustCompile(`'epoch':\s*(\d+)(?:\.\d+)?`)
+
 	for _, pod := range listTrainingPods(test, namespace, trainJobName) {
 		if pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
 		logs := PodLog(test, namespace, pod.Name, corev1.PodLogOptions{Container: "node"})(test)
-		if pattern.MatchString(logs) {
-			test.T().Logf("Epoch >= %d detected in pod %s logs", minEpoch, pod.Name)
-			return true
+
+		// Find all epoch values in logs and check if any meet the minimum threshold
+		matches := pattern.FindAllStringSubmatch(logs, -1)
+		for _, match := range matches {
+			if len(match) > 1 {
+				if epochVal, err := strconv.Atoi(match[1]); err == nil && epochVal >= minEpoch {
+					test.T().Logf("Epoch %d (>= %d) detected in pod %s logs", epochVal, minEpoch, pod.Name)
+					return true
+				}
+			}
 		}
 	}
 	return false
