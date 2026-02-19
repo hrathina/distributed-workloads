@@ -59,98 +59,6 @@ func boolStr(b bool) string {
 	return "false"
 }
 
-// parseURIScheme extracts the scheme from a URI (e.g., "s3://bucket/path" -> "s3")
-func parseURIScheme(uri string) string {
-	if idx := strings.Index(uri, "://"); idx > 0 {
-		return uri[:idx]
-	}
-	return ""
-}
-
-// getS3EnvVars retrieves S3 environment variables for the given checkpoint URI
-func getS3EnvVars(checkpointURI string) map[string]string {
-	endpoint, _ := GetStorageBucketDefaultEndpoint()
-	accessKey, _ := GetStorageBucketAccessKeyId()
-	secretKey, _ := GetStorageBucketSecretKey()
-
-	if endpoint == "" || accessKey == "" || secretKey == "" {
-		return nil // S3 not configured
-	}
-
-	return map[string]string{
-		"CHECKPOINT_OUTPUT_DIR": checkpointURI,
-		"AWS_DEFAULT_ENDPOINT":  endpoint,
-		"AWS_ACCESS_KEY_ID":     accessKey,
-		"AWS_SECRET_ACCESS_KEY": secretKey,
-	}
-}
-
-// getCloudStorageEnvVars returns environment variables for cloud storage cleanup
-// based on the checkpoint URI scheme. Returns nil if not a cloud storage URI or not configured.
-// Easy to extend: add cases for "azure", "gs" (GCS), etc.
-func getCloudStorageEnvVars(checkpointURI string) map[string]string {
-	scheme := parseURIScheme(checkpointURI)
-
-	switch scheme {
-	case "s3":
-		return getS3EnvVars(checkpointURI)
-	// Future: add cases for other cloud providers (Azure, GCS, etc.)
-	default:
-		return nil // Not a cloud storage URI (e.g., PVC path)
-	}
-}
-
-// createCloudStorageDataConnection creates a Kubernetes Data Connection secret for cloud checkpointing
-// and returns the export string for environment variables. Returns empty string if not configured.
-// Accepts pre-retrieved credentials to avoid duplicate retrieval. If credentials are nil, retrieves them.
-// Provider-agnostic: automatically detects scheme (s3://, azure://, etc.). Easy to extend for new cloud providers.
-func createCloudStorageDataConnection(test Test, namespace string, checkpointURI string, envVars map[string]string) string {
-	scheme := parseURIScheme(checkpointURI)
-	if scheme == "" {
-		return "" // Not a cloud storage URI
-	}
-
-	// Use provided credentials if available, otherwise retrieve them
-	if envVars == nil {
-		envVars = getCloudStorageEnvVars(checkpointURI)
-		if envVars == nil {
-			return "" // Credentials not configured
-		}
-	}
-
-	// Transform env vars to Data Connection secret format based on URI scheme
-	var secretData map[string]string
-
-	switch scheme {
-	case "s3":
-		secretData = map[string]string{
-			"AWS_ACCESS_KEY_ID":     envVars["AWS_ACCESS_KEY_ID"],
-			"AWS_SECRET_ACCESS_KEY": envVars["AWS_SECRET_ACCESS_KEY"],
-			"AWS_S3_ENDPOINT":       envVars["AWS_DEFAULT_ENDPOINT"],
-		}
-		// Add all optional fields that are available (use whatever is provided in envVars)
-		// Check for AWS_S3_BUCKET directly (for checkpoint bucket) or AWS_STORAGE_BUCKET (for models bucket)
-		// SDK expects AWS_S3_BUCKET in the secret
-		if bucket, ok := envVars["AWS_S3_BUCKET"]; ok && bucket != "" {
-			secretData["AWS_S3_BUCKET"] = bucket
-		} else if bucket, ok := envVars["AWS_STORAGE_BUCKET"]; ok && bucket != "" {
-			secretData["AWS_S3_BUCKET"] = bucket
-		}
-	// Future: add cases for other cloud providers (Azure, GCS, etc.)
-	default:
-		return "" // Unsupported scheme
-	}
-
-	dataConnectionSecret := CreateSecret(test, namespace, secretData)
-	test.T().Logf("Created Data Connection secret: %s for cloud checkpoint storage", dataConnectionSecret.Name)
-
-	return fmt.Sprintf(
-		"export DATA_CONNECTION_NAME='%s'; "+
-			"export CHECKPOINT_VERIFY_SSL='false'; "+
-			"export KUBEFLOW_INSTALL_FROM_GIT='true'; ",
-		dataConnectionSecret.Name,
-	)
-}
 
 // RhaiFeatureConfig holds configuration for RHAI feature tests
 type RhaiFeatureConfig struct {
@@ -324,7 +232,7 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 
 	// RBACs setup for user (user token is used by notebook for Trainer API calls)
 	userName := common.GetNotebookUserName(test)
-	userToken := common.GenerateNotebookUserToken(test)
+	userToken := common.GetNotebookUserToken(test)
 	CreateUserRoleBindingWithClusterRole(test, userName, namespace.Name, "admin")
 	// ClusterRoleBinding for cluster-scoped resources (ClusterTrainingRuntimes) - minimal get/list/watch access
 	trainerutils.CreateUserClusterRoleBindingForTrainerRuntimes(test, userName)
@@ -343,13 +251,11 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 		rhaiFeaturesNotebookName: nb,
 		"install_kubeflow.py":    installScript,
 	}
-	// Parse checkpoint URI scheme once and reuse throughout the function
-	checkpointScheme := parseURIScheme(config.CheckpointOutputDir)
 	cm := CreateConfigMap(test, namespace.Name, cmData)
 
-	// Prepare cloud checkpoint storage before creating notebook
+	// Prepare cloud checkpoint storage before creating notebook (only for cloud storage, not PVC)
 	// Errors are logged but do not cause test failures
-	if checkpointScheme != "" {
+	if trainerutils.ParseCloudURI(config.CheckpointOutputDir) != nil {
 		trainerutils.PrepareCloudCheckpointStorage(test, config.CheckpointOutputDir)
 	}
 
@@ -437,41 +343,35 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 	// Note: Data Connection is ONLY for checkpoints. The checkpoint bucket is extracted from CHECKPOINT_OUTPUT_DIR.
 	// AWS_STORAGE_BUCKET (for models/datasets) is separate and handled in s3Exports above.
 	var dataConnectionExports string
-	if checkpointScheme != "" {
-		// Build envVars for checkpoint storage only
+	checkpointURI := trainerutils.ParseCloudURI(config.CheckpointOutputDir)
+	if checkpointURI != nil && checkpointURI.Scheme == "s3" && s3Endpoint != "" && s3AccessKey != "" && s3SecretKey != "" {
 		// Extract bucket name from checkpoint URI (e.g., s3://bucket/checkpoints -> bucket)
 		// This bucket is used in the Data Connection secret as AWS_S3_BUCKET
-		var envVars map[string]string
-		if checkpointScheme == "s3" && s3Endpoint != "" && s3AccessKey != "" && s3SecretKey != "" {
-			// Parse checkpoint URI to extract bucket name for Data Connection
-			// Format: s3://bucket/checkpoints -> extract "bucket"
-			checkpointBucket := ""
-			if strings.HasPrefix(config.CheckpointOutputDir, "s3://") {
-				rest := strings.TrimPrefix(config.CheckpointOutputDir, "s3://")
-				parts := strings.SplitN(rest, "/", 2)
-				if len(parts) > 0 {
-					checkpointBucket = parts[0]
-				}
-			}
+		checkpointBucket := checkpointURI.Bucket
 
-			envVars = map[string]string{
-				"CHECKPOINT_OUTPUT_DIR": config.CheckpointOutputDir,
-				"AWS_DEFAULT_ENDPOINT":  s3Endpoint,
-				"AWS_ACCESS_KEY_ID":     s3AccessKey,
-				"AWS_SECRET_ACCESS_KEY": s3SecretKey,
-			}
-			// Add checkpoint bucket for Data Connection (mapped to AWS_S3_BUCKET in createCloudStorageDataConnection)
-			// This is ONLY for the Data Connection secret, NOT exposed to notebook as AWS_STORAGE_BUCKET
-			if checkpointBucket != "" {
-				envVars["AWS_S3_BUCKET"] = checkpointBucket
-			}
+		// Create Data Connection secret for S3 checkpoint storage
+		secretData := map[string]string{
+			"AWS_ACCESS_KEY_ID":     s3AccessKey,
+			"AWS_SECRET_ACCESS_KEY": s3SecretKey,
+			"AWS_S3_ENDPOINT":       s3Endpoint,
 		}
-		dataConnectionExports = createCloudStorageDataConnection(test, namespace.Name, config.CheckpointOutputDir, envVars)
-		if dataConnectionExports != "" {
-			test.T().Logf("Data Connection configured for cloud checkpointing: %s", config.CheckpointOutputDir)
-		} else {
-			test.T().Logf("Warning: Cloud storage URI detected (%s) but Data Connection not created (credentials may be missing)", config.CheckpointOutputDir)
+		// SDK expects AWS_S3_BUCKET in the secret
+		if checkpointBucket != "" {
+			secretData["AWS_S3_BUCKET"] = checkpointBucket
 		}
+
+		secret := CreateSecret(test, namespace.Name, secretData)
+		test.T().Logf("Created Data Connection secret: %s for cloud checkpoint storage", secret.Name)
+
+		dataConnectionExports = fmt.Sprintf(
+			"export DATA_CONNECTION_NAME='%s'; "+
+				"export CHECKPOINT_VERIFY_SSL='false'; "+
+				"export KUBEFLOW_INSTALL_FROM_GIT='true'; ",
+			secret.Name,
+		)
+		test.T().Logf("Data Connection configured for cloud checkpointing: %s", config.CheckpointOutputDir)
+	} else if checkpointURI != nil {
+		test.T().Logf("Warning: Cloud storage URI detected (%s) but Data Connection not created (credentials may be missing or unsupported scheme)", config.CheckpointOutputDir)
 	}
 
 	// Determine GPU type from Accelerator.ResourceLabel (e.g., "nvidia.com/gpu" → "nvidia")
@@ -548,8 +448,8 @@ func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
 
 	// Cleanup - use longer timeout due to large runtime images
 	defer func() {
-		// Clean up cloud storage checkpoints if using cloud storage
-		if checkpointScheme != "" {
+		// Clean up cloud storage checkpoints if using cloud storage (not PVC)
+		if trainerutils.ParseCloudURI(config.CheckpointOutputDir) != nil {
 			trainerutils.CleanupCloudCheckpointStorage(test, config.CheckpointOutputDir)
 		}
 		// Clean up Kubernetes resources
@@ -825,10 +725,11 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 	}, TestTimeoutMedium, 5*time.Second).Should(BeTrue(), "Training should complete at least 2 epochs before suspension")
 	test.T().Log("At least 2 epochs completed - ready to suspend")
 
-	// Verify cloud checkpoint upload is working (only for cloud storage mode)
+	// Verify cloud checkpoint upload is working (only for cloud storage mode, not PVC)
 	// This catches SDK monkey-patch failures early - if save_strategy override didn't apply,
 	// no checkpoints are saved and no uploads happen
-	if strings.Contains(checkpointDir, "://") {
+	checkpointURI := trainerutils.ParseCloudURI(checkpointDir)
+	if checkpointURI != nil && checkpointURI.Scheme == "s3" {
 		test.T().Log("Step 1b: Verifying cloud checkpoint upload is working...")
 		test.Eventually(func() bool {
 			for _, pod := range listTrainingPods(test, namespace, trainJobName) {
@@ -841,7 +742,7 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 					test.T().Log("Waiting for SDK save_strategy override to appear in logs...")
 					return false
 				}
-				// Check at least one checkpoint was uploaded to cloud storage
+				// Check at least one checkpoint was uploaded to cloud storage (from logs)
 				if strings.Contains(logs, "[Kubeflow] Upload complete:") {
 					test.T().Log("Cloud checkpoint upload confirmed in pod logs")
 					return true
@@ -853,7 +754,16 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 				"Expected '[Kubeflow] Upload complete:' after epoch completion. "+
 				"This usually means the SDK's checkpoint config override (save_strategy, output_dir) "+
 				"was not applied to the Trainer. Check full training pod logs for '[Kubeflow]' messages.")
-		test.T().Log("Cloud checkpoint upload verified - periodic checkpoints are being saved to cloud storage")
+		test.T().Log("Cloud checkpoint upload verified in logs - verifying checkpoints exist in S3...")
+		
+		// Verify checkpoints actually exist in S3 (not just logs)
+		test.Eventually(func() bool {
+			return trainerutils.CheckpointExistsInS3(test, checkpointDir)
+		}, TestTimeoutMedium, 5*time.Second).Should(BeTrue(),
+			"Checkpoints not found in S3 storage. Expected checkpoint objects to exist in %s. "+
+				"This verifies that the SDK's checkpoint upload functionality is working correctly.",
+			checkpointDir)
+		test.T().Log("Cloud checkpoint upload verified - checkpoints confirmed in S3 storage")
 	}
 
 	// Step 2: Suspend the TrainJob to trigger JIT checkpoint save
