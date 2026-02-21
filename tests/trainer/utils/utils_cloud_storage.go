@@ -33,6 +33,12 @@ import (
 	. "github.com/opendatahub-io/distributed-workloads/tests/common/support"
 )
 
+const (
+	// ConstantBucketName is the bucket name used for all test cases
+	// This ensures consistent bucket reuse across tests, even if cleanup fails
+	ConstantBucketName = "test-checkpoints"
+)
+
 // CloudURI represents a parsed cloud storage URI
 type CloudURI struct {
 	Scheme string // e.g., "s3", "azure", "gs"
@@ -72,159 +78,115 @@ func ParseCloudURI(uri string) *CloudURI {
 // CloudStorageProvider defines the interface for cloud storage operations.
 // Easy to extend: implement for Azure, GCS, etc.
 type CloudStorageProvider interface {
-	// PrepareStorage deletes old objects and creates a .keep file to ensure prefix exists
-	PrepareStorage(ctx context.Context, uri *CloudURI) error
-	// CleanupStorage deletes all objects under the prefix
-	CleanupStorage(ctx context.Context, uri *CloudURI) (int, error)
 	// CreateBucket creates a new bucket if it doesn't exist
 	CreateBucket(ctx context.Context, bucketName string) error
 	// DeleteBucket deletes a bucket and all its contents
 	DeleteBucket(ctx context.Context, bucketName string) error
 	// BucketExists checks if a bucket exists
 	BucketExists(ctx context.Context, bucketName string) (bool, error)
+	// CheckpointExists verifies at least one checkpoint exists at the URI
+	CheckpointExists(ctx context.Context, uri string) bool
 }
 
 // S3Provider implements CloudStorageProvider for S3-compatible storage
+// Uses singleton pattern to reuse the same client across all operations
 type S3Provider struct {
-	endpoint  string
-	accessKey string
-	secretKey string
+	client *minio.Client
 }
 
-// NewS3Provider creates a new S3 provider using environment credentials.
-// Credentials are retrieved from environment variables (AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY).
-// This pattern can be followed for other providers:
-//   - Azure: Get Azure credentials from AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY, etc.
-//   - GCS: Get GCS credentials from GOOGLE_APPLICATION_CREDENTIALS or GCS_* env vars
-func NewS3Provider() (*S3Provider, error) {
-	endpoint, _ := GetStorageBucketDefaultEndpoint()
-	accessKey, _ := GetStorageBucketAccessKeyId()
-	secretKey, _ := GetStorageBucketSecretKey()
+var (
+	s3ProviderOnce sync.Once
+	s3Provider     *S3Provider
+	s3ProviderErr  error
+)
 
-	if endpoint == "" || accessKey == "" || secretKey == "" {
-		return nil, fmt.Errorf("S3 credentials not configured")
-	}
+// GetS3Provider returns a singleton S3 provider with a single reused client.
+// The client is created once on first call and reused for all subsequent calls.
+// This is more efficient than creating a new client for each operation.
+func GetS3Provider() (*S3Provider, error) {
+	s3ProviderOnce.Do(func() {
+		endpoint, _ := GetStorageBucketDefaultEndpoint()
+		accessKey, _ := GetStorageBucketAccessKeyId()
+		secretKey, _ := GetStorageBucketSecretKey()
 
-	return &S3Provider{
-		endpoint:  endpoint,
-		accessKey: accessKey,
-		secretKey: secretKey,
-	}, nil
-}
-
-// GetS3Client creates an S3 client with the provider's credentials
-func (p *S3Provider) GetS3Client() (*minio.Client, error) {
-	endpointURL := p.endpoint
-	secure := true
-	if !strings.HasPrefix(endpointURL, "http") {
-		endpointURL = "https://" + endpointURL
-	} else if strings.HasPrefix(endpointURL, "http://") {
-		secure = false
-	}
-
-	// Extract host:port from URL (remove http:// or https://)
-	endpoint := strings.TrimPrefix(strings.TrimPrefix(endpointURL, "https://"), "http://")
-
-	// Configure TLS verification based on environment variable
-	// CHECKPOINT_VERIFY_SSL can be set to "true" to enable certificate verification
-	// Defaults to false to support test environments with self-signed certificates
-	verifySSL := false
-	if verifySSLEnv := os.Getenv("CHECKPOINT_VERIFY_SSL"); verifySSLEnv != "" {
-		if val, err := strconv.ParseBool(verifySSLEnv); err == nil {
-			verifySSL = val
+		if endpoint == "" || accessKey == "" || secretKey == "" {
+			s3ProviderErr = fmt.Errorf("S3 credentials not configured")
+			return
 		}
-	}
 
-	var tr *http.Transport
-	if !verifySSL {
-		// Skip TLS verification for test environments with self-signed certificates
-		tr = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
+		// Parse endpoint
+		secure := !strings.HasPrefix(endpoint, "http://")
+		endpoint = strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
+
+		// Configure TLS verification based on environment variable
+		// CHECKPOINT_VERIFY_SSL can be set to "true" to enable certificate verification
+		// Defaults to false to support test environments with self-signed certificates
+		verifySSL := false
+		if verifySSLEnv := os.Getenv("CHECKPOINT_VERIFY_SSL"); verifySSLEnv != "" {
+			if val, err := strconv.ParseBool(verifySSLEnv); err == nil {
+				verifySSL = val
+			}
 		}
-	}
 
-	client, err := minio.New(endpoint, &minio.Options{
-		Creds:     credentials.NewStaticV4(p.accessKey, p.secretKey, ""),
-		Secure:    secure,
-		Transport: tr,
+		var transport *http.Transport
+		if !verifySSL {
+			// Skip TLS verification for test environments with self-signed certificates
+			transport = &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+				},
+			}
+		}
+
+		// Create client ONCE and reuse it
+		client, err := minio.New(endpoint, &minio.Options{
+			Creds:     credentials.NewStaticV4(accessKey, secretKey, ""),
+			Secure:    secure,
+			Transport: transport,
+		})
+		if err != nil {
+			s3ProviderErr = fmt.Errorf("failed to create S3 client: %w", err)
+			return
+		}
+
+		s3Provider = &S3Provider{client: client}
 	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create S3 client: %w", err)
-	}
 
-	return client, nil
+	return s3Provider, s3ProviderErr
 }
 
-// PrepareStorage deletes old objects and creates a .keep file for S3
-func (p *S3Provider) PrepareStorage(ctx context.Context, uri *CloudURI) error {
-	if uri.Bucket == "" || uri.Prefix == "" {
-		return fmt.Errorf("invalid URI: bucket and prefix required")
+// CheckpointExists verifies at least one checkpoint exists at the S3 URI.
+// URI format: s3://bucket/prefix/path
+// Returns false if checkpoints don't exist OR if any error occurs (can't connect, invalid URI, etc.)
+// In test context, both cases should fail the test anyway.
+func (p *S3Provider) CheckpointExists(ctx context.Context, uri string) bool {
+	// Parse URI: s3://bucket/prefix -> bucket, prefix
+	parts := strings.TrimPrefix(uri, "s3://")
+	idx := strings.Index(parts, "/")
+	if idx < 0 {
+		return false // Invalid URI format
 	}
+	bucket := parts[:idx]
+	prefix := parts[idx+1:] + "/"
 
-	client, err := p.GetS3Client()
-	if err != nil {
-		return err
-	}
-
-	// Delete all existing objects under the prefix
-	fullPrefix := strings.TrimSuffix(uri.Prefix, "/") + "/"
-	objectsCh := client.ListObjects(ctx, uri.Bucket, minio.ListObjectsOptions{
-		Prefix:    fullPrefix,
+	// List objects under prefix
+	objectsCh := p.client.ListObjects(ctx, bucket, minio.ListObjectsOptions{
+		Prefix:    prefix,
 		Recursive: true,
 	})
 
-	deleted := 0
-	for object := range objectsCh {
-		if object.Err != nil {
-			return fmt.Errorf("failed to list objects: %w", object.Err)
+	// Check if at least one valid checkpoint object exists
+	for obj := range objectsCh {
+		if obj.Err != nil {
+			return false // Error listing objects
 		}
-		if err := client.RemoveObject(ctx, uri.Bucket, object.Key, minio.RemoveObjectOptions{}); err != nil {
-			return fmt.Errorf("failed to delete object %s: %w", object.Key, err)
+		// Skip .incomplete markers - we only want complete checkpoints
+		if !strings.Contains(obj.Key, ".incomplete") {
+			return true // Found at least one checkpoint
 		}
-		deleted++
 	}
 
-	// Create .keep file to ensure prefix exists
-	keepKey := strings.TrimSuffix(uri.Prefix, "/") + "/.keep"
-	_, err = client.PutObject(ctx, uri.Bucket, keepKey, strings.NewReader("placeholder"), int64(len("placeholder")), minio.PutObjectOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to create .keep file: %w", err)
-	}
-
-	return nil
-}
-
-// CleanupStorage deletes all objects under the prefix for S3
-func (p *S3Provider) CleanupStorage(ctx context.Context, uri *CloudURI) (int, error) {
-	if uri.Bucket == "" || uri.Prefix == "" {
-		return 0, fmt.Errorf("invalid URI: bucket and prefix required")
-	}
-
-	client, err := p.GetS3Client()
-	if err != nil {
-		return 0, err
-	}
-
-	fullPrefix := strings.TrimSuffix(uri.Prefix, "/") + "/"
-	objectsCh := client.ListObjects(ctx, uri.Bucket, minio.ListObjectsOptions{
-		Prefix:    fullPrefix,
-		Recursive: true,
-	})
-
-	deleted := 0
-	for object := range objectsCh {
-		if object.Err != nil {
-			return deleted, fmt.Errorf("failed to list objects: %w", object.Err)
-		}
-		if err := client.RemoveObject(ctx, uri.Bucket, object.Key, minio.RemoveObjectOptions{}); err != nil {
-			return deleted, fmt.Errorf("failed to delete object %s: %w", object.Key, err)
-		}
-		deleted++
-	}
-
-	return deleted, nil
+	return false // No checkpoints found
 }
 
 // CreateBucket creates a new S3 bucket if it doesn't exist
@@ -233,13 +195,8 @@ func (p *S3Provider) CreateBucket(ctx context.Context, bucketName string) error 
 		return fmt.Errorf("bucket name cannot be empty")
 	}
 
-	client, err := p.GetS3Client()
-	if err != nil {
-		return err
-	}
-
 	// Check if bucket already exists
-	exists, err := client.BucketExists(ctx, bucketName)
+	exists, err := p.client.BucketExists(ctx, bucketName)
 	if err != nil {
 		return fmt.Errorf("failed to check if bucket exists: %w", err)
 	}
@@ -249,8 +206,7 @@ func (p *S3Provider) CreateBucket(ctx context.Context, bucketName string) error 
 	}
 
 	// Create the bucket
-	err = client.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{})
-	if err != nil {
+	if err := p.client.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{}); err != nil {
 		return fmt.Errorf("failed to create bucket %s: %w", bucketName, err)
 	}
 
@@ -263,13 +219,8 @@ func (p *S3Provider) DeleteBucket(ctx context.Context, bucketName string) error 
 		return fmt.Errorf("bucket name cannot be empty")
 	}
 
-	client, err := p.GetS3Client()
-	if err != nil {
-		return err
-	}
-
 	// Check if bucket exists
-	exists, err := client.BucketExists(ctx, bucketName)
+	exists, err := p.client.BucketExists(ctx, bucketName)
 	if err != nil {
 		return fmt.Errorf("failed to check if bucket exists: %w", err)
 	}
@@ -279,7 +230,7 @@ func (p *S3Provider) DeleteBucket(ctx context.Context, bucketName string) error 
 	}
 
 	// Delete all objects in the bucket first
-	objectsCh := client.ListObjects(ctx, bucketName, minio.ListObjectsOptions{
+	objectsCh := p.client.ListObjects(ctx, bucketName, minio.ListObjectsOptions{
 		Recursive: true,
 	})
 
@@ -287,14 +238,13 @@ func (p *S3Provider) DeleteBucket(ctx context.Context, bucketName string) error 
 		if object.Err != nil {
 			return fmt.Errorf("failed to list objects: %w", object.Err)
 		}
-		if err := client.RemoveObject(ctx, bucketName, object.Key, minio.RemoveObjectOptions{}); err != nil {
+		if err := p.client.RemoveObject(ctx, bucketName, object.Key, minio.RemoveObjectOptions{}); err != nil {
 			return fmt.Errorf("failed to delete object %s: %w", object.Key, err)
 		}
 	}
 
 	// Delete the bucket
-	err = client.RemoveBucket(ctx, bucketName)
-	if err != nil {
+	if err := p.client.RemoveBucket(ctx, bucketName); err != nil {
 		return fmt.Errorf("failed to delete bucket %s: %w", bucketName, err)
 	}
 
@@ -307,12 +257,7 @@ func (p *S3Provider) BucketExists(ctx context.Context, bucketName string) (bool,
 		return false, fmt.Errorf("bucket name cannot be empty")
 	}
 
-	client, err := p.GetS3Client()
-	if err != nil {
-		return false, err
-	}
-
-	exists, err := client.BucketExists(ctx, bucketName)
+	exists, err := p.client.BucketExists(ctx, bucketName)
 	if err != nil {
 		return false, fmt.Errorf("failed to check if bucket exists: %w", err)
 	}
@@ -320,305 +265,11 @@ func (p *S3Provider) BucketExists(ctx context.Context, bucketName string) (bool,
 	return exists, nil
 }
 
-// getCloudStorageProvider returns the appropriate provider for the given URI scheme.
-// Easy to extend: add cases for "azure", "gs" (GCS), etc.
-func getCloudStorageProvider(scheme string) (CloudStorageProvider, error) {
-	switch scheme {
-	case "s3":
-		return NewS3Provider()
-	// Future: add cases for other cloud providers
-	default:
-		return nil, fmt.Errorf("unsupported cloud storage scheme: %s", scheme)
-	}
-}
-
-// PrepareCloudCheckpointStorage prepares cloud checkpoint storage by deleting old objects
-// and creating a .keep file to ensure the prefix exists.
-// Returns nil on success or if the URI is not cloud storage. Errors are logged but
-// do not cause test failures, allowing tests to continue even if storage operations fail.
-func PrepareCloudCheckpointStorage(test Test, checkpointURI string) error {
-	test.T().Helper()
-
-	uri := ParseCloudURI(checkpointURI)
-	if uri == nil {
-		return nil // Not a cloud storage URI, skip
-	}
-
-	provider, err := getCloudStorageProvider(uri.Scheme)
-	if err != nil {
-		test.T().Logf("Cloud checkpoint prep: skip (%v)", err)
-		return nil
-	}
-
-	ctx := test.Ctx()
-	if err := provider.PrepareStorage(ctx, uri); err != nil {
-		test.T().Logf("Cloud checkpoint prep warning: %v", err)
-		return nil
-	}
-
-	test.T().Logf("Cloud checkpoint prep complete: cleaned and created %s://%s/%s/.keep", uri.Scheme, uri.Bucket, uri.Prefix)
-	return nil
-}
-
-// CleanupCloudCheckpointStorage cleans up cloud checkpoint storage by deleting all objects
-// under the specified prefix. Returns the number of objects deleted.
-// Errors are logged but do not cause test failures, allowing tests to continue even if
-// cleanup operations fail.
-func CleanupCloudCheckpointStorage(test Test, checkpointURI string) int {
-	test.T().Helper()
-
-	uri := ParseCloudURI(checkpointURI)
-	if uri == nil {
-		test.T().Logf("Cloud checkpoint cleanup: skip (not cloud storage)")
-		return 0
-	}
-
-	provider, err := getCloudStorageProvider(uri.Scheme)
-	if err != nil {
-		test.T().Logf("Cloud checkpoint cleanup: skip (%v)", err)
-		return 0
-	}
-
-	ctx := test.Ctx()
-	deleted, err := provider.CleanupStorage(ctx, uri)
-	if err != nil {
-		test.T().Logf("Cloud checkpoint cleanup warning: %v", err)
-		return deleted
-	}
-
-	test.T().Logf("Cloud checkpoint cleanup: deleted %d objects from %s://%s/%s", deleted, uri.Scheme, uri.Bucket, uri.Prefix)
-	return deleted
-}
-
-// Package-level variables to track dynamically created buckets
-var (
-	dynamicallyCreatedBuckets = make(map[string]bool)
-	bucketCreationMutex       sync.Mutex
-)
-
-// GetOrCreateS3Bucket returns a shared S3 bucket for all S3 checkpoint tests.
-// The first call creates a new bucket and stores it in sharedS3BucketName.
-// Subsequent calls reuse the same bucket across all test namespaces.
-// The bucket is cleaned up after all tests complete via TestMain cleanup.
-var sharedS3BucketName string
-
-func GetOrCreateS3Bucket(test Test) (string, error) {
-	test.T().Helper()
-
-	bucketCreationMutex.Lock()
-	defer bucketCreationMutex.Unlock()
-
-	// Reuse the same bucket if it already exists
-	if sharedS3BucketName != "" {
-		// Verify the bucket still exists
-		provider, err := NewS3Provider()
-		if err == nil {
-			ctx := test.Ctx()
-			exists, err := provider.BucketExists(ctx, sharedS3BucketName)
-			if err == nil && exists {
-				test.T().Logf("Reusing existing shared S3 bucket: %s", sharedS3BucketName)
-				return sharedS3BucketName, nil
-			}
-		}
-	}
-
-	// Create a new shared bucket for all S3 tests
+// GenerateCheckpointPrefix generates a unique timestamp-based prefix for checkpoints.
+// Format: <timestamp>-checkpoints (e.g., 1234567890-checkpoints)
+// This ensures each test run uses a unique prefix, avoiding conflicts even if
+// bucket cleanup fails from a previous test.
+func GenerateCheckpointPrefix() string {
 	timestamp := time.Now().Unix()
-	bucketName := fmt.Sprintf("test-checkpoints-%d", timestamp)
-
-	// Create S3 provider
-	provider, err := NewS3Provider()
-	if err != nil {
-		return "", fmt.Errorf("failed to create S3 provider: %w", err)
-	}
-
-	// Create the bucket
-	ctx := test.Ctx()
-	if err := provider.CreateBucket(ctx, bucketName); err != nil {
-		return "", fmt.Errorf("failed to create bucket %s: %w", bucketName, err)
-	}
-
-	// Track this bucket for cleanup and store as shared bucket
-	dynamicallyCreatedBuckets[bucketName] = true
-	sharedS3BucketName = bucketName
-	test.T().Logf("Created shared S3 bucket for all S3 tests: %s (will be cleaned up after all tests)", bucketName)
-
-	return bucketName, nil
-}
-
-// isS3Configured checks if all required S3 credentials are configured
-func isS3Configured() bool {
-	endpoint, _ := GetStorageBucketDefaultEndpoint()
-	accessKey, _ := GetStorageBucketAccessKeyId()
-	secretKey, _ := GetStorageBucketSecretKey()
-	return endpoint != "" && accessKey != "" && secretKey != ""
-}
-
-// CheckpointExistsInS3 verifies that at least one checkpoint object exists in S3 storage.
-// Returns true if checkpoints are found, false otherwise. Errors are logged but do not cause failures.
-func CheckpointExistsInS3(test Test, checkpointURI string) bool {
-	test.T().Helper()
-
-	uri := ParseCloudURI(checkpointURI)
-	if uri == nil || uri.Scheme != "s3" {
-		return false // Not an S3 URI
-	}
-
-	provider, err := NewS3Provider()
-	if err != nil {
-		test.T().Logf("Failed to create S3 provider to verify checkpoints: %v", err)
-		return false
-	}
-
-	client, err := provider.GetS3Client()
-	if err != nil {
-		test.T().Logf("Failed to create S3 client to verify checkpoints: %v", err)
-		return false
-	}
-
-	// List objects under the checkpoint prefix (exclude .keep file)
-	fullPrefix := strings.TrimSuffix(uri.Prefix, "/") + "/"
-	objectsCh := client.ListObjects(test.Ctx(), uri.Bucket, minio.ListObjectsOptions{
-		Prefix:    fullPrefix,
-		Recursive: true,
-	})
-
-	objectCount := 0
-	for object := range objectsCh {
-		if object.Err != nil {
-			test.T().Logf("Error listing objects in S3: %v", object.Err)
-			return false
-		}
-		// Skip .keep file and .incomplete markers
-		if !strings.HasSuffix(object.Key, "/.keep") && !strings.Contains(object.Key, ".incomplete") {
-			objectCount++
-		}
-	}
-
-	return objectCount > 0
-}
-
-// CleanupDynamicallyCreatedBuckets deletes all buckets that were created dynamically during tests.
-// This should be called after all S3 tests complete.
-// Only attempts cleanup if S3 credentials are fully configured (endpoint, accessKey, secretKey).
-// This function can be called from TestMain where a Test interface may not be available.
-func CleanupDynamicallyCreatedBuckets() {
-	bucketCreationMutex.Lock()
-	defer bucketCreationMutex.Unlock()
-
-	if len(dynamicallyCreatedBuckets) == 0 {
-		return
-	}
-
-	// Only cleanup if S3 credentials are fully configured
-	// If credentials aren't configured, tests wouldn't have run anyway, so no buckets to clean
-	if !isS3Configured() {
-		fmt.Printf("S3 credentials not configured, skipping bucket cleanup\n")
-		return
-	}
-
-	provider, err := NewS3Provider()
-	if err != nil {
-		fmt.Printf("Failed to create S3 provider for bucket cleanup: %v\n", err)
-		return
-	}
-
-	ctx := context.Background()
-	for bucketName := range dynamicallyCreatedBuckets {
-		fmt.Printf("Cleaning up dynamically created bucket: %s\n", bucketName)
-		if err := provider.DeleteBucket(ctx, bucketName); err != nil {
-			fmt.Printf("Warning: failed to delete bucket %s: %v\n", bucketName, err)
-		} else {
-			fmt.Printf("Successfully deleted bucket: %s\n", bucketName)
-		}
-		delete(dynamicallyCreatedBuckets, bucketName)
-	}
-}
-
-// CheckpointType represents the type of FSDP checkpoint
-type CheckpointType string
-
-const (
-	CheckpointTypeFullState   CheckpointType = "FULL_STATE_DICT"
-	CheckpointTypeSharedState CheckpointType = "SHARDED_STATE_DICT"
-	CheckpointTypeUnknown     CheckpointType = "UNKNOWN"
-)
-
-// VerifyCheckpointType verifies whether checkpoints in S3 are full state or shared state
-// by analyzing the file structure. Returns the detected checkpoint type.
-func VerifyCheckpointType(test Test, checkpointURI string) CheckpointType {
-	test.T().Helper()
-
-	uri := parseCloudURI(checkpointURI)
-	if uri == nil {
-		test.T().Log("Not a cloud storage URI, cannot verify checkpoint type")
-		return CheckpointTypeUnknown
-	}
-
-	provider, err := getCloudStorageProvider(uri.Scheme)
-	if err != nil {
-		test.T().Logf("Failed to get cloud storage provider: %v", err)
-		return CheckpointTypeUnknown
-	}
-
-	s3Provider, ok := provider.(*S3Provider)
-	if !ok {
-		test.T().Log("Only S3 checkpoints are supported for verification")
-		return CheckpointTypeUnknown
-	}
-
-	client, err := s3Provider.getS3Client()
-	if err != nil {
-		test.T().Logf("Failed to create S3 client: %v", err)
-		return CheckpointTypeUnknown
-	}
-
-	// List all checkpoint files
-	fullPrefix := strings.TrimSuffix(uri.Prefix, "/") + "/"
-	objectsCh := client.ListObjects(test.Ctx(), uri.Bucket, minio.ListObjectsOptions{
-		Prefix:    fullPrefix,
-		Recursive: true,
-	})
-
-	var files []string
-	for object := range objectsCh {
-		if object.Err != nil {
-			test.T().Logf("Error listing objects: %v", object.Err)
-			continue
-		}
-		// Extract filename from full path
-		filename := strings.TrimPrefix(object.Key, fullPrefix)
-		if filename != "" && filename != ".keep" {
-			files = append(files, filename)
-		}
-	}
-
-	if len(files) == 0 {
-		test.T().Log("No checkpoint files found")
-		return CheckpointTypeUnknown
-	}
-
-	test.T().Logf("Found %d checkpoint files", len(files))
-
-	// Check for FSDP sharded state indicators:
-	// - Multiple rank-specific files (e.g., __0_0.distcp, __1_0.distcp)
-	// - Metadata files (.metadata)
-	hasShardedMetadata := false
-	for _, file := range files {
-		// SHARDED_STATE_DICT creates .distcp files or numbered model shards
-		if strings.Contains(file, ".distcp") || strings.Contains(file, "__") {
-			hasShardedMetadata = true
-			test.T().Logf("Found sharded state indicator: %s", file)
-			break
-		}
-	}
-
-	if hasShardedMetadata {
-		test.T().Log("Checkpoint type: SHARDED_STATE_DICT (shared state)")
-		return CheckpointTypeSharedState
-	}
-
-	// FULL_STATE_DICT creates unified checkpoint files without sharding metadata
-	test.T().Log("Checkpoint type: FULL_STATE_DICT (full state)")
-	return CheckpointTypeFullState
+	return fmt.Sprintf("%d-checkpoints", timestamp)
 }

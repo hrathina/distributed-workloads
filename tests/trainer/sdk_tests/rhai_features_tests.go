@@ -40,10 +40,6 @@ import (
 const (
 	rhaiFeaturesNotebookName = "rhai_features.ipynb"
 	rhaiFeaturesNotebookPath = "resources/" + rhaiFeaturesNotebookName
-	rhaiFeaturesFSDPFullStateNotebookName = "rhai_features_fsdp_full_state.ipynb"
-	rhaiFeaturesFSDPFullStateNotebookPath = "resources/" + rhaiFeaturesFSDPFullStateNotebookName
-	rhaiFeaturesFSDPSharedStateNotebookName = "rhai_features_fsdp_shared_state.ipynb"
-	rhaiFeaturesFSDPSharedStateNotebookPath = "resources/" + rhaiFeaturesFSDPSharedStateNotebookName
 
 	// Annotation keys for progression tracking (must match SDK/training-operator constants)
 	annotationProgressionTracking = "trainer.opendatahub.io/progression-tracking"
@@ -156,206 +152,50 @@ func RunRhaiFeaturesAllMultiGpuTest(t *testing.T, accelerator Accelerator, numNo
 	})
 }
 
-// RunRhaiS3CheckpointTest runs the e2e test for S3 checkpoint storage (requires S3 configuration)
+// runS3CheckpointTest is a helper that sets up S3 storage and runs the checkpoint test
+func runS3CheckpointTest(t *testing.T, accelerator Accelerator, numNodes, numGpusPerNode int) {
+	test := With(t)
+
+	// Get S3 provider (validates credentials internally)
+	provider, err := trainerutils.GetS3Provider()
+	if err != nil {
+		t.Fatalf("S3 configuration required. Please set AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY: %v", err)
+	}
+
+	// Create test bucket
+	if err := provider.CreateBucket(test.Ctx(), trainerutils.ConstantBucketName); err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+	test.T().Logf("Test bucket ready: %s", trainerutils.ConstantBucketName)
+
+	// Generate unique timestamp-based prefix
+	checkpointPrefix := trainerutils.GenerateCheckpointPrefix()
+	t.Logf("Using bucket: %s, prefix: %s", trainerutils.ConstantBucketName, checkpointPrefix)
+
+	runRhaiFeaturesTestWithConfig(t, RhaiFeatureConfig{
+		EnableProgressionTracking: false,
+		EnableJitCheckpoint:       true,
+		CheckpointOutputDir:       fmt.Sprintf("s3://%s/%s", trainerutils.ConstantBucketName, checkpointPrefix),
+		CheckpointSaveStrategy:    "epoch",
+		CheckpointSaveTotalLimit:  "3",
+		Accelerator:               accelerator,
+		NumNodes:                  numNodes,
+		NumGpusPerNode:            numGpusPerNode,
+	})
+}
+
+// RunRhaiS3CheckpointTest runs the e2e test for S3 checkpoint storage
 func RunRhaiS3CheckpointTest(t *testing.T, accelerator Accelerator) {
-	test := With(t)
-
-	// Check if all S3 credentials are configured (same check as NewS3Provider)
-	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
-	s3AccessKey, _ := GetStorageBucketAccessKeyId()
-	s3SecretKey, _ := GetStorageBucketSecretKey()
-	if s3Endpoint == "" || s3AccessKey == "" || s3SecretKey == "" {
-		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY")
-	}
-
-	// Get or create shared S3 bucket for all S3 checkpoint tests
-	// The same bucket is reused across all S3 tests to avoid creating multiple buckets
-	s3Bucket, err := trainerutils.GetOrCreateS3Bucket(test)
-	if err != nil {
-		t.Fatalf("Failed to create S3 bucket: %v", err)
-	}
-	t.Logf("Using shared S3 bucket: %s (will be cleaned up after all tests)", s3Bucket)
-
-	runRhaiFeaturesTestWithConfig(t, RhaiFeatureConfig{
-		EnableProgressionTracking: false,
-		EnableJitCheckpoint:       true,
-		CheckpointOutputDir:       fmt.Sprintf("s3://%s/checkpoints", s3Bucket),
-		CheckpointSaveStrategy:    "epoch",
-		CheckpointSaveTotalLimit:  "3",
-		Accelerator:               accelerator,
-		NumNodes:                  2,
-		NumGpusPerNode:            1,
-	})
+	runS3CheckpointTest(t, accelerator, 2, 1)
 }
 
-// RunRhaiS3CheckpointMultiGpuTest runs multi-GPU test for S3 checkpoint storage (requires S3 configuration)
+// RunRhaiS3CheckpointMultiGpuTest runs multi-GPU test for S3 checkpoint storage
 func RunRhaiS3CheckpointMultiGpuTest(t *testing.T, accelerator Accelerator, numNodes, numGpusPerNode int) {
-	test := With(t)
-
-	// Check if all S3 credentials are configured (same check as NewS3Provider)
-	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
-	s3AccessKey, _ := GetStorageBucketAccessKeyId()
-	s3SecretKey, _ := GetStorageBucketSecretKey()
-	if s3Endpoint == "" || s3AccessKey == "" || s3SecretKey == "" {
-		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY")
-	}
-
-	// Get or create shared S3 bucket for all S3 checkpoint tests
-	// The same bucket is reused across all S3 tests to avoid creating multiple buckets
-	s3Bucket, err := trainerutils.GetOrCreateS3Bucket(test)
-	if err != nil {
-		t.Fatalf("Failed to create S3 bucket: %v", err)
-	}
-	t.Logf("Using shared S3 bucket: %s (will be cleaned up after all tests)", s3Bucket)
-
-	runRhaiFeaturesTestWithConfig(t, RhaiFeatureConfig{
-		EnableProgressionTracking: false,
-		EnableJitCheckpoint:       true,
-		CheckpointOutputDir:       fmt.Sprintf("s3://%s/checkpoints", s3Bucket),
-		CheckpointSaveStrategy:    "epoch",
-		CheckpointSaveTotalLimit:  "3",
-		Accelerator:               accelerator,
-		NumNodes:                  numNodes,
-		NumGpusPerNode:            numGpusPerNode,
-	})
-}
-
-// RunRhaiS3CheckpointFSDPTest runs the e2e test for S3 checkpoint storage with FSDP (requires S3 configuration)
-func RunRhaiS3CheckpointFSDPTest(t *testing.T, accelerator Accelerator) {
-	test := With(t)
-
-	// Check if all S3 credentials are configured (same check as NewS3Provider)
-	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
-	s3AccessKey, _ := GetStorageBucketAccessKeyId()
-	s3SecretKey, _ := GetStorageBucketSecretKey()
-	if s3Endpoint == "" || s3AccessKey == "" || s3SecretKey == "" {
-		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY")
-	}
-
-	// Get or create shared S3 bucket for all S3 checkpoint tests
-	// The same bucket is reused across all S3 tests to avoid creating multiple buckets
-	s3Bucket, err := trainerutils.GetOrCreateS3Bucket(test)
-	if err != nil {
-		t.Fatalf("Failed to create S3 bucket: %v", err)
-	}
-	t.Logf("Using shared S3 bucket: %s (will be cleaned up after all tests)", s3Bucket)
-
-	runRhaiFeaturesTestWithConfigAndNotebook(t, RhaiFeatureConfig{
-		EnableProgressionTracking: false,
-		EnableJitCheckpoint:       true,
-		CheckpointOutputDir:       fmt.Sprintf("s3://%s/checkpoints", s3Bucket),
-		CheckpointSaveStrategy:    "epoch",
-		CheckpointSaveTotalLimit:  "3",
-		Accelerator:               accelerator,
-		NumNodes:                  2,
-		NumGpusPerNode:            1,
-	}, rhaiFeaturesFSDPFullStateNotebookPath, rhaiFeaturesFSDPFullStateNotebookName)
-}
-
-// RunRhaiS3CheckpointFSDPMultiGpuTest runs multi-GPU test for S3 checkpoint storage with FSDP (requires S3 configuration)
-func RunRhaiS3CheckpointFSDPMultiGpuTest(t *testing.T, accelerator Accelerator, numNodes, numGpusPerNode int) {
-	test := With(t)
-
-	// Check if all S3 credentials are configured (same check as NewS3Provider)
-	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
-	s3AccessKey, _ := GetStorageBucketAccessKeyId()
-	s3SecretKey, _ := GetStorageBucketSecretKey()
-	if s3Endpoint == "" || s3AccessKey == "" || s3SecretKey == "" {
-		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY")
-	}
-
-	// Get or create shared S3 bucket for all S3 checkpoint tests
-	// The same bucket is reused across all S3 tests to avoid creating multiple buckets
-	s3Bucket, err := trainerutils.GetOrCreateS3Bucket(test)
-	if err != nil {
-		t.Fatalf("Failed to create S3 bucket: %v", err)
-	}
-	t.Logf("Using shared S3 bucket: %s (will be cleaned up after all tests)", s3Bucket)
-
-	runRhaiFeaturesTestWithConfigAndNotebook(t, RhaiFeatureConfig{
-		EnableProgressionTracking: false,
-		EnableJitCheckpoint:       true,
-		CheckpointOutputDir:       fmt.Sprintf("s3://%s/checkpoints", s3Bucket),
-		CheckpointSaveStrategy:    "epoch",
-		CheckpointSaveTotalLimit:  "3",
-		Accelerator:               accelerator,
-		NumNodes:                  numNodes,
-		NumGpusPerNode:            numGpusPerNode,
-	}, rhaiFeaturesFSDPFullStateNotebookPath, rhaiFeaturesFSDPFullStateNotebookName)
-}
-
-// RunRhaiS3CheckpointFSDPSharedStateTest runs the e2e test for S3 checkpoint storage with FSDP shared state (requires S3 configuration)
-func RunRhaiS3CheckpointFSDPSharedStateTest(t *testing.T, accelerator Accelerator) {
-	test := With(t)
-
-	// Check if all S3 credentials are configured (same check as NewS3Provider)
-	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
-	s3AccessKey, _ := GetStorageBucketAccessKeyId()
-	s3SecretKey, _ := GetStorageBucketSecretKey()
-	if s3Endpoint == "" || s3AccessKey == "" || s3SecretKey == "" {
-		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY")
-	}
-
-	// Get or create shared S3 bucket for all S3 checkpoint tests
-	// The same bucket is reused across all S3 tests to avoid creating multiple buckets
-	s3Bucket, err := trainerutils.GetOrCreateS3Bucket(test)
-	if err != nil {
-		t.Fatalf("Failed to create S3 bucket: %v", err)
-	}
-	t.Logf("Using shared S3 bucket: %s (will be cleaned up after all tests)", s3Bucket)
-
-	runRhaiFeaturesTestWithConfigAndNotebook(t, RhaiFeatureConfig{
-		EnableProgressionTracking: false,
-		EnableJitCheckpoint:       true,
-		CheckpointOutputDir:       fmt.Sprintf("s3://%s/checkpoints", s3Bucket),
-		CheckpointSaveStrategy:    "epoch",
-		CheckpointSaveTotalLimit:  "3",
-		Accelerator:               accelerator,
-		NumNodes:                  2,
-		NumGpusPerNode:            1,
-	}, rhaiFeaturesFSDPSharedStateNotebookPath, rhaiFeaturesFSDPSharedStateNotebookName)
-}
-
-// RunRhaiS3CheckpointFSDPSharedStateMultiGpuTest runs multi-GPU test for S3 checkpoint storage with FSDP shared state (requires S3 configuration)
-func RunRhaiS3CheckpointFSDPSharedStateMultiGpuTest(t *testing.T, accelerator Accelerator, numNodes, numGpusPerNode int) {
-	test := With(t)
-
-	// Check if all S3 credentials are configured (same check as NewS3Provider)
-	s3Endpoint, _ := GetStorageBucketDefaultEndpoint()
-	s3AccessKey, _ := GetStorageBucketAccessKeyId()
-	s3SecretKey, _ := GetStorageBucketSecretKey()
-	if s3Endpoint == "" || s3AccessKey == "" || s3SecretKey == "" {
-		t.Fatalf("S3 configuration required for S3 checkpoint test. Please set AWS_DEFAULT_ENDPOINT, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY")
-	}
-
-	// Get or create shared S3 bucket for all S3 checkpoint tests
-	// The same bucket is reused across all S3 tests to avoid creating multiple buckets
-	s3Bucket, err := trainerutils.GetOrCreateS3Bucket(test)
-	if err != nil {
-		t.Fatalf("Failed to create S3 bucket: %v", err)
-	}
-	t.Logf("Using shared S3 bucket: %s (will be cleaned up after all tests)", s3Bucket)
-
-	runRhaiFeaturesTestWithConfigAndNotebook(t, RhaiFeatureConfig{
-		EnableProgressionTracking: false,
-		EnableJitCheckpoint:       true,
-		CheckpointOutputDir:       fmt.Sprintf("s3://%s/checkpoints", s3Bucket),
-		CheckpointSaveStrategy:    "epoch",
-		CheckpointSaveTotalLimit:  "3",
-		Accelerator:               accelerator,
-		NumNodes:                  numNodes,
-		NumGpusPerNode:            numGpusPerNode,
-	}, rhaiFeaturesFSDPSharedStateNotebookPath, rhaiFeaturesFSDPSharedStateNotebookName)
+	runS3CheckpointTest(t, accelerator, numNodes, numGpusPerNode)
 }
 
 // runRhaiFeaturesTestWithConfig runs the e2e test with the given feature configuration
-// Uses the default DDP notebook (rhai_features.ipynb)
 func runRhaiFeaturesTestWithConfig(t *testing.T, config RhaiFeatureConfig) {
-	runRhaiFeaturesTestWithConfigAndNotebook(t, config, rhaiFeaturesNotebookPath, rhaiFeaturesNotebookName)
-}
-
-// runRhaiFeaturesTestWithConfigAndNotebook runs the e2e test with the given feature configuration and notebook
-func runRhaiFeaturesTestWithConfigAndNotebook(t *testing.T, config RhaiFeatureConfig, notebookPath, notebookName string) {
 	test := With(t)
 
 	// Create a new test namespace
@@ -366,13 +206,13 @@ func runRhaiFeaturesTestWithConfigAndNotebook(t *testing.T, config RhaiFeatureCo
 
 	// RBACs setup for user (user token is used by notebook for Trainer API calls)
 	userName := common.GetNotebookUserName(test)
-	userToken := common.GetNotebookUserToken(test)
+	userToken := common.GenerateNotebookUserToken(test)
 	CreateUserRoleBindingWithClusterRole(test, userName, namespace.Name, "admin")
 	// ClusterRoleBinding for cluster-scoped resources (ClusterTrainingRuntimes) - minimal get/list/watch access
 	trainerutils.CreateUserClusterRoleBindingForTrainerRuntimes(test, userName)
 
 	// Create ConfigMap with notebook and install script
-	localPath := notebookPath
+	localPath := rhaiFeaturesNotebookPath
 	nb, err := os.ReadFile(localPath)
 	test.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("failed to read notebook: %s", localPath))
 
@@ -382,16 +222,10 @@ func runRhaiFeaturesTestWithConfigAndNotebook(t *testing.T, config RhaiFeatureCo
 	test.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("failed to read install script: %s", installScriptPath))
 
 	cmData := map[string][]byte{
-		notebookName: nb,
-		"install_kubeflow.py": installScript,
+		rhaiFeaturesNotebookName: nb,
+		"install_kubeflow.py":    installScript,
 	}
 	cm := CreateConfigMap(test, namespace.Name, cmData)
-
-	// Prepare cloud checkpoint storage before creating notebook (only for cloud storage, not PVC)
-	// Errors are logged but do not cause test failures
-	if trainerutils.ParseCloudURI(config.CheckpointOutputDir) != nil {
-		trainerutils.PrepareCloudCheckpointStorage(test, config.CheckpointOutputDir)
-	}
 
 	// Create shared RWX PVC for distributed training (HF cache shared across nodes)
 	storageClass, err := GetRWXStorageClass(test)
@@ -444,7 +278,7 @@ func runRhaiFeaturesTestWithConfigAndNotebook(t *testing.T, config RhaiFeatureCo
 	s3Exports := ""
 	if s3Endpoint != "" && modelsBucket != "" {
 		// Verify bucket exists before using it
-		provider, err := trainerutils.NewS3Provider()
+		provider, err := trainerutils.GetS3Provider()
 		if err == nil {
 			ctx := test.Ctx()
 			exists, err := provider.BucketExists(ctx, modelsBucket)
@@ -563,7 +397,7 @@ func runRhaiFeaturesTestWithConfigAndNotebook(t *testing.T, config RhaiFeatureCo
 		dataConnectionExports,
 		pipExports,
 		pipInstallFlags,
-		notebookName,
+		rhaiFeaturesNotebookName,
 	)
 
 	test.T().Logf("Feature config: ProgressionTracking=%v, JitCheckpoint=%v, Accelerator=%s, NumNodes=%d, NumGpusPerNode=%d",
@@ -571,17 +405,27 @@ func runRhaiFeaturesTestWithConfigAndNotebook(t *testing.T, config RhaiFeatureCo
 	command := []string{"/bin/sh", "-c", shellCmd}
 
 	// Create Notebook CR using the RWX PVC
-	common.CreateNotebook(test, namespace, userToken, command, cm.Name, notebookName, 0, sharedPVC, common.ContainerSizeSmall)
+	common.CreateNotebook(test, namespace, userToken, command, cm.Name, rhaiFeaturesNotebookName, 0, sharedPVC, common.ContainerSizeSmall)
 
 	// Cleanup - use longer timeout due to large runtime images
 	defer func() {
-		// Clean up cloud storage checkpoints if using cloud storage (not PVC)
-		if trainerutils.ParseCloudURI(config.CheckpointOutputDir) != nil {
-			trainerutils.CleanupCloudCheckpointStorage(test, config.CheckpointOutputDir)
-		}
 		// Clean up Kubernetes resources
 		common.DeleteNotebook(test, namespace)
 		test.Eventually(common.Notebooks(test, namespace), TestTimeoutGpuProvisioning).Should(HaveLen(0))
+
+		// Clean up S3 bucket if using cloud storage (deletes entire bucket with all prefixes)
+		if trainerutils.ParseCloudURI(config.CheckpointOutputDir) != nil {
+			provider, err := trainerutils.GetS3Provider()
+			if err != nil {
+				test.T().Logf("Warning: failed to get S3 provider: %v", err)
+				return
+			}
+			if err := provider.DeleteBucket(test.Ctx(), trainerutils.ConstantBucketName); err != nil {
+				test.T().Logf("Warning: failed to delete test bucket: %v", err)
+			} else {
+				test.T().Logf("Test bucket deleted: %s (all checkpoints cleaned)", trainerutils.ConstantBucketName)
+			}
+		}
 	}()
 
 	// Wait for the Notebook Pod to be running
@@ -884,8 +728,16 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 		test.T().Log("Cloud checkpoint upload verified in logs - verifying checkpoints exist in S3...")
 
 		// Verify checkpoints actually exist in S3 (not just logs)
+		provider, err := trainerutils.GetS3Provider()
+		test.Expect(err).NotTo(HaveOccurred(), "Failed to get S3 provider for checkpoint verification")
 		test.Eventually(func() bool {
-			return trainerutils.CheckpointExistsInS3(test, checkpointDir)
+			exists := provider.CheckpointExists(test.Ctx(), checkpointDir)
+			if exists {
+				test.T().Logf("Checkpoints verified in S3: %s", checkpointDir)
+			} else {
+				test.T().Logf("No checkpoints found in S3: %s", checkpointDir)
+			}
+			return exists
 		}, TestTimeoutMedium, 5*time.Second).Should(BeTrue(),
 			"Checkpoints not found in S3 storage. Expected checkpoint objects to exist in %s. "+
 				"This verifies that the SDK's checkpoint upload functionality is working correctly.",
@@ -998,13 +850,6 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 	// Step 9: Verify logs show checkpoint was loaded
 	test.T().Log("Step 9: Verifying checkpoint was loaded from logs...")
 	verifyCheckpointLoadedFromLogs(test, namespace, trainJobName, checkpointDir)
-
-	// Step 10: Verify checkpoint type (only for S3 checkpoints)
-	if strings.Contains(checkpointDir, "://") {
-		test.T().Log("Step 10: Verifying checkpoint type...")
-		checkpointType := trainerutils.VerifyCheckpointType(test, checkpointDir)
-		test.T().Logf("Detected checkpoint type: %s", checkpointType)
-	}
 
 	test.T().Log("JIT checkpoint verification completed successfully!")
 }
