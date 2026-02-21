@@ -42,11 +42,6 @@ func TestMain(m *testing.M) {
 	// Run all tests only if setup succeeded
 	m.Run()
 
-	// Cleanup dynamically created S3 buckets after all tests
-	// Cleanup function will check if S3 credentials are fully configured before attempting cleanup
-	// If credentials aren't configured, tests wouldn't have run anyway, so no buckets to clean
-	trainerutils.CleanupDynamicallyCreatedBuckets()
-
 	// TearDown Kueue: Only set to Removed if it was not already Unmanaged before tests
 	if initialKueueState != "Unmanaged" {
 		if err := TearDownComponent(DefaultDSCName, "kueue"); err != nil {
