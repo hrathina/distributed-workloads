@@ -724,6 +724,55 @@ func verifyCheckpoints(test Test, namespace, trainJobName, checkpointDir string,
 	}, TestTimeoutMedium, 5*time.Second).Should(BeTrue(), "Training should complete at least 2 epochs before suspension")
 	test.T().Log("At least 2 epochs completed - ready to suspend")
 
+	// Verify cloud checkpoint upload is working (only for cloud storage mode, not PVC)
+	// This catches SDK monkey-patch failures early - if save_strategy override didn't apply,
+	// no checkpoints are saved and no uploads happen
+	checkpointURI := trainerutils.ParseCloudURI(checkpointDir)
+	if checkpointURI != nil && checkpointURI.Scheme == "s3" && checkpointURI.Bucket != "" {
+		test.T().Log("Step 1b: Verifying cloud checkpoint upload is working...")
+		test.Eventually(func() bool {
+			for _, pod := range listTrainingPods(test, namespace, trainJobName) {
+				if pod.Status.Phase != corev1.PodRunning {
+					continue
+				}
+				logs := PodLog(test, namespace, pod.Name, corev1.PodLogOptions{Container: "node"})(test)
+				// Check SDK applied the save_strategy override (monkey-patch working)
+				if !strings.Contains(logs, "[Kubeflow] Applied save_strategy:") {
+					test.T().Log("Waiting for SDK save_strategy override to appear in logs...")
+					return false
+				}
+				// Check at least one checkpoint was uploaded to cloud storage (from logs)
+				if strings.Contains(logs, "[Kubeflow] Upload complete:") {
+					test.T().Log("Cloud checkpoint upload confirmed in pod logs")
+					return true
+				}
+			}
+			return false
+		}, TestTimeoutMedium, 5*time.Second).Should(BeTrue(),
+			"Cloud checkpoint upload not detected in training pod logs. "+
+				"Expected '[Kubeflow] Upload complete:' after epoch completion. "+
+				"This usually means the SDK's checkpoint config override (save_strategy, output_dir) "+
+				"was not applied to the Trainer. Check full training pod logs for '[Kubeflow]' messages.")
+		test.T().Log("Cloud checkpoint upload verified in logs - verifying checkpoints exist in S3...")
+
+		// Verify checkpoints actually exist in S3 (not just logs)
+		provider, err := trainerutils.GetS3Provider()
+		test.Expect(err).NotTo(HaveOccurred(), "Failed to get S3 provider for checkpoint verification")
+		test.Eventually(func() bool {
+			exists := provider.CheckpointExists(test.Ctx(), checkpointDir)
+			if exists {
+				test.T().Logf("Checkpoints verified in S3: %s", checkpointDir)
+			} else {
+				test.T().Logf("No checkpoints found in S3: %s", checkpointDir)
+			}
+			return exists
+		}, TestTimeoutMedium, 5*time.Second).Should(BeTrue(),
+			"Checkpoints not found in S3 storage. Expected checkpoint objects to exist in %s. "+
+				"This verifies that the SDK's checkpoint upload functionality is working correctly.",
+			checkpointDir)
+		test.T().Log("Cloud checkpoint upload verified - checkpoints confirmed in S3 storage")
+	}
+
 	// Step 2: Suspend the TrainJob to trigger JIT checkpoint save
 	test.T().Log("Step 2: Suspending TrainJob to trigger checkpoint save...")
 	suspendTrainJob(test, namespace, trainJobName, true)
