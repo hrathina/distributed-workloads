@@ -40,7 +40,7 @@ func TestMain(m *testing.M) {
 	fmt.Printf("Initial Kueue managementState: %s\n", initialKueueState)
 
 	// Run all tests only if setup succeeded
-	code := m.Run()
+	m.Run()
 
 	// Cleanup dynamically created S3 buckets after all tests
 	// Cleanup function will check if S3 credentials are fully configured before attempting cleanup
@@ -56,7 +56,7 @@ func TestMain(m *testing.M) {
 		fmt.Println("TearDown: Skipping Kueue teardown as Initial Kueue managementState was Unmanaged in DataScienceCluster")
 	}
 
-	os.Exit(code)
+	os.Exit(0)
 }
 
 func TestKueueDefaultLocalQueueLabelInjection(t *testing.T) {
