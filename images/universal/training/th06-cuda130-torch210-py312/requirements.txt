@@ -204,7 +204,7 @@ hf-transfer==0.1.9
     # via
     #   unsloth
     #   unsloth-zoo
-hf-xet==1.4.3
+hf-xet==1.5.2
     # via
     #   th06-cuda-universal-image (pyproject.toml)
     #   huggingface-hub

@@ -73,7 +73,9 @@ charset-normalizer==3.4.7
 click==8.4.1
     # via
     #   flask
+    #   huggingface-hub
     #   mlflow-skinny
+    #   typer
     #   uvicorn
 cloudpickle==3.1.2
     # via mlflow-skinny
@@ -171,7 +173,7 @@ h11==0.16.0
     # via
     #   httpcore
     #   uvicorn
-hf-xet==1.4.3
+hf-xet==1.5.2
     # via huggingface-hub
 httpcore==1.0.9
     # via httpx
@@ -181,7 +183,7 @@ httpx==0.28.1
     #   huggingface-hub
 huey==2.6.0
     # via mlflow
-huggingface-hub==1.13.0
+huggingface-hub==1.19.0
     # via
     #   accelerate
     #   datasets
@@ -568,7 +570,7 @@ trl==0.24.0
     # via
     #   th06-cpu-universal-image (pyproject.toml)
     #   instructlab-training
-typer==0.26.7
+typer==0.25.1
     # via
     #   huggingface-hub
     #   rhai-innovation-mini-trainer
